@@ -15,6 +15,7 @@ from PIL import Image
 
 from app.config import settings
 from app.jobs import pipeline
+from app.llm.writer import reset_writer
 from app.main import app
 
 
@@ -30,7 +31,9 @@ def test_concurrency_is_capped(tmp_path, monkeypatch):
     monkeypatch.setattr(settings, "database_path", storage / "test.db")
     monkeypatch.setattr(settings, "storage_dir", storage)
     monkeypatch.setattr(settings, "tts_enabled", False)
+    monkeypatch.setattr(settings, "gemini_api_key", "")
     monkeypatch.setattr(settings, "llm_api_key", "")
+    reset_writer()
 
     for directory in (settings.images_dir, settings.audio_dir):
         directory.mkdir(parents=True, exist_ok=True)
@@ -80,7 +83,9 @@ def test_every_burst_upload_gets_its_own_result(tmp_path, monkeypatch):
     monkeypatch.setattr(settings, "database_path", storage / "test.db")
     monkeypatch.setattr(settings, "storage_dir", storage)
     monkeypatch.setattr(settings, "tts_enabled", False)
+    monkeypatch.setattr(settings, "gemini_api_key", "")
     monkeypatch.setattr(settings, "llm_api_key", "")
+    reset_writer()
 
     for directory in (settings.images_dir, settings.audio_dir):
         directory.mkdir(parents=True, exist_ok=True)

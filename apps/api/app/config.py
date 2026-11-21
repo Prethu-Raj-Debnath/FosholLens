@@ -14,11 +14,12 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 APP_DIR = Path(__file__).resolve().parent
 API_ROOT = APP_DIR.parent
+REPO_ROOT = API_ROOT.parent.parent
 
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
-        env_file=API_ROOT / ".env",
+        env_file=(REPO_ROOT / ".env", API_ROOT / ".env"),
         env_file_encoding="utf-8",
         extra="ignore",
     )
@@ -29,6 +30,9 @@ class Settings(BaseSettings):
     cors_origin: str = "http://localhost:5173"
 
     # ---- LLM (optional: without a key the template writer is used) ----
+    llm_provider: Literal["auto", "gemini", "openai"] = "auto"
+    gemini_api_key: str = ""
+    gemini_model: str = "gemini-3.8-flash"
     llm_base_url: str = "https://tokens.bd/v1"
     llm_api_key: str = ""
     llm_model: str = "openai/gpt-6-luna"
@@ -95,8 +99,14 @@ class Settings(BaseSettings):
         return [origin.strip() for origin in self.cors_origin.split(",") if origin.strip()]
 
     @property
+    def effective_gemini_api_key(self) -> str:
+        return (self.gemini_api_key or self.llm_api_key).strip()
+
+    @property
     def llm_configured(self) -> bool:
-        return bool(self.llm_api_key)
+        if self.llm_provider == "openai":
+            return bool(self.llm_api_key.strip())
+        return bool(self.gemini_api_key.strip() or self.llm_api_key.strip())
 
     @property
     def is_development(self) -> bool:

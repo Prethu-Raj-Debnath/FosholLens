@@ -1,13 +1,14 @@
 """The Bangla narrative writer.
 
-Two implementations behind one interface:
+Implementations behind the `Writer` protocol:
 
-* `LlmWriter`      - asks the model, then validates the output hard.
+* `GeminiWriter`   - primary Google Gemini Flash writer (with model fallback) + hard validator.
+* `LlmWriter`      - optional OpenAI-compatible writer + hard validator.
 * `TemplateWriter` - composes from the same facts with no network at all.
 
-The template path is not a stub. It is what runs whenever the LLM is
-unconfigured, rate-limited, over a spend cap, or returns unusable text, so the
-product never depends on a third-party service being reachable.
+The template path is not a stub. It is what runs automatically whenever no LLM
+key is configured, the provider is unreachable/rate-limited, or the model
+returns unusable text, so the product never depends on an external API.
 """
 
 from __future__ import annotations
@@ -18,6 +19,8 @@ import logging
 import re
 import unicodedata
 from typing import Any, Protocol
+
+from pydantic import BaseModel
 
 from ..config import settings
 
@@ -129,17 +132,137 @@ SYSTEM_PROMPT = """\
 তুমি বাংলাদেশের একজন কৃষি পরামর্শক। কৃষকের জন্য ছোট, সহজ, মুখে বলার মতো একটি পরামর্শ লেখো।
 
 নিয়ম:
-- সবসময় বাংলা অক্ষরে বাংলায় লিখবে। কোনো ইংরেজি অক্ষর, রোমান হরফ বা ইংরেজি শব্দ ব্যবহার করবে না।
+- সবসময় চলিত বাংলায়, কেবল বাংলা অক্ষরে লিখবে। কোনো ইংরেজি অক্ষর, রোমান হরফ বা ইংরেজি শব্দ ব্যবহার করবে না।
 - ২ থেকে ৪ বাক্য। ২৫ থেকে ৯০ শব্দের মধ্যে রাখবে।
 - একজন কৃষক আরেকজন কৃষককে যেভাবে বলেন, সেভাবে সরল ভাষায় লিখবে। সম্মানসূচক 'আপনি' ব্যবহার করবে।
 - কোনো মার্কডাউন, বুলেট, ইমোজি, লিংক বা তালিকা নয়। শুধু টানা বাক্য।
 - ওষুধ ও মাত্রা কেবল নিচে দেওয়া তথ্য থেকে নেবে। নিজের থেকে কোনো নতুন ওষুধ, মাত্রা বা রোগের নাম বানাবে না।
 - ওষুধের নাম বাংলা অক্ষরে লিখবে, যেমনটি তথ্যে দেওয়া আছে।
+- রাসায়নিক স্প্রে উল্লেখ থাকলে সংক্ষেপে গ্লাভস ও মাস্ক পরা এবং সাবান দিয়ে হাত ধোয়ার কথা মনে করিয়ে দেবে।
 - সংখ্যা বাংলা অঙ্কে লিখবে (০-৯)।
 - আবহাওয়ার তথ্য না থাকলে আবহাওয়ার কথা একেবারেই বলবে না।
 - রোগ নিশ্চিত না হলে সেটি স্পষ্ট বলবে এবং উপজেলা কৃষি কর্মকর্তার পরামর্শ নিতে বলবে।
 - শেষে সবসময় মনে করিয়ে দেবে যে এটি একটি আনুমানিক পরামর্শ।
 """
+
+DEFAULT_GEMINI_MODEL = "gemini-3.8-flash"
+FALLBACK_GEMINI_MODELS: tuple[str, ...] = (
+    "gemini-3.8-flash",
+    "gemini-3.7-flash",
+    "gemini-3.5-flash",
+    "gemini-3.5-flash-lite",
+)
+_RETRYABLE_GEMINI_CODES = frozenset({404, 429, 503})
+
+
+class _SpokenAdvice(BaseModel):
+    spoken: str
+
+
+def _candidate_gemini_models() -> list[str]:
+    primary = settings.gemini_model.strip() or DEFAULT_GEMINI_MODEL
+    candidates = [primary]
+    for model in FALLBACK_GEMINI_MODELS:
+        if model not in candidates:
+            candidates.append(model)
+    return candidates
+
+
+class GeminiWriter:
+    """Primary Bangla advisory writer backed by Google Gemini Flash."""
+
+    def __init__(self) -> None:
+        from google import genai
+        from google.genai import types
+
+        api_key = settings.effective_gemini_api_key
+        if not api_key:
+            raise RuntimeError(
+                "GEMINI_API_KEY (or LLM_API_KEY) is not configured for GeminiWriter."
+            )
+
+        self._client: Any = genai.Client(
+            api_key=api_key,
+            http_options=types.HttpOptions(timeout=settings.llm_timeout_ms),
+        )
+        self._semaphore = asyncio.Semaphore(settings.llm_max_concurrency)
+
+    async def write(self, facts: dict[str, Any]) -> tuple[str, str]:
+        allowed = [chemical["bnName"] for chemical in facts["treatment"]["chemical"]]
+        last_error: Exception | None = None
+
+        for attempt in (1, 2):
+            try:
+                text = await self._attempt(facts, allowed, is_retry=attempt == 2)
+                return text, "llm"
+            except InvalidNarrative as exc:
+                last_error = exc
+                log.warning("Gemini output rejected (attempt %d): %s", attempt, exc)
+            except Exception as exc:
+                log.warning("Gemini call failed: %s", exc.__class__.__name__)
+                raise
+
+        raise InvalidNarrative(f"unusable_after_retry:{last_error}")
+
+    async def _attempt(self, facts: dict[str, Any], allowed: list[str], *, is_retry: bool) -> str:
+        from google.genai import types
+
+        payload = json.dumps(facts, ensure_ascii=False, indent=2)
+        if is_retry:
+            user_prompt = (
+                "আগের উত্তরটি নিয়ম মানেনি। এবার কেবল বাংলা অক্ষরে, "
+                "২ থেকে ৪ বাক্যে, কোনো ইংরেজি অক্ষর ছাড়া লেখো।\n\n"
+                f"তথ্য:\n{payload}"
+            )
+        else:
+            user_prompt = f"তথ্য:\n{payload}"
+
+        config = types.GenerateContentConfig(
+            system_instruction=SYSTEM_PROMPT,
+            response_mime_type="application/json",
+            response_schema=_SpokenAdvice,
+            temperature=0.35,
+        )
+
+        async with self._semaphore:
+            response = await asyncio.to_thread(
+                self._generate_with_fallback, user_prompt, config
+            )
+
+        raw_text = (getattr(response, "text", None) or "").strip()
+        if not raw_text:
+            raise InvalidNarrative("empty")
+
+        try:
+            parsed = json.loads(raw_text)
+        except json.JSONDecodeError as exc:
+            raise InvalidNarrative("invalid_json") from exc
+
+        if not isinstance(parsed, dict) or not isinstance(parsed.get("spoken"), str):
+            raise InvalidNarrative("missing_spoken")
+
+        return validate_narrative(parsed["spoken"], allowed)
+
+    def _generate_with_fallback(self, user_prompt: str, config: Any) -> Any:
+        from google.genai import errors as genai_errors
+
+        last_exc: Exception | None = None
+        for model_name in _candidate_gemini_models():
+            try:
+                return self._client.models.generate_content(
+                    model=model_name,
+                    contents=user_prompt,
+                    config=config,
+                )
+            except genai_errors.APIError as exc:
+                last_exc = exc
+                if exc.code in _RETRYABLE_GEMINI_CODES:
+                    logger_msg = "Gemini model %s returned HTTP %s; trying fallback model."
+                    log.warning(logger_msg, model_name, exc.code)
+                    continue
+                raise
+
+        raise RuntimeError(f"All Gemini Flash models failed: {last_exc}") from last_exc
 
 _TOOL: dict[str, Any] = {
     "type": "function",
@@ -281,12 +404,21 @@ class TemplateWriter:
 
 
 def build_writer() -> Writer:
-    if settings.llm_configured:
+    if not settings.llm_configured:
+        return TemplateWriter()
+
+    if settings.llm_provider == "openai":
         try:
             return LlmWriter()
         except Exception as exc:  # noqa: BLE001 - any construction failure degrades
-            log.error("LLM writer unavailable (%s); falling back to template", exc)
-    return TemplateWriter()
+            log.error("OpenAI-compatible writer unavailable (%s); falling back to template", exc)
+            return TemplateWriter()
+
+    try:
+        return GeminiWriter()
+    except Exception as exc:  # noqa: BLE001 - any construction failure degrades
+        log.error("Gemini writer unavailable (%s); falling back to template", exc)
+        return TemplateWriter()
 
 
 _writer: Writer | None = None

@@ -29,7 +29,13 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     purged = await store.purge_older_than(settings.analysis_retention_days)
     if purged:
         log.info("purged %d analyses older than %d days", purged, settings.analysis_retention_days)
-    log.info("LLM: %s", "enabled" if settings.llm_configured else "template fallback")
+    if not settings.llm_configured:
+        llm_status = "template fallback"
+    elif settings.llm_provider == "openai":
+        llm_status = f"openai ({settings.llm_model})"
+    else:
+        llm_status = f"gemini ({settings.gemini_model})"
+    log.info("LLM: %s", llm_status)
     log.info("TTS: %s", "enabled" if settings.tts_enabled else "disabled")
     _log_vision_status()
     yield

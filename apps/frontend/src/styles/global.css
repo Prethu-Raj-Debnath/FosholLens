@@ -43,7 +43,7 @@
   --header-h: 68px;
   --bottom-nav-h: 72px;
 
-  --font-bn: system-ui, -apple-system, 'Segoe UI', Roboto, 'Noto Sans Bengali',
+  --font-bn: 'Noto Sans Bengali', system-ui, -apple-system, 'Segoe UI', Roboto,
     'Nirmala UI', 'Kalpurush', 'SolaimanLipi', sans-serif;
 }
 

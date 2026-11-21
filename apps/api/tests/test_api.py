@@ -15,7 +15,9 @@ from fastapi.testclient import TestClient
 from PIL import Image
 
 from app.config import settings
+from app.contracts import AnalysisResult
 from app.grounding.weather import WeatherFacts
+from app.llm.writer import GeminiWriter, reset_writer
 from app.main import app
 
 
@@ -32,13 +34,18 @@ def client(tmp_path, monkeypatch):
     monkeypatch.setattr(settings, "storage_dir", storage)
     monkeypatch.setattr(settings, "tts_enabled", False)
     monkeypatch.setattr(settings, "vision_enabled", False)
+    monkeypatch.setattr(settings, "llm_provider", "auto")
+    monkeypatch.setattr(settings, "gemini_api_key", "")
     monkeypatch.setattr(settings, "llm_api_key", "")
+    reset_writer()
 
     for directory in (settings.images_dir, settings.audio_dir):
         directory.mkdir(parents=True, exist_ok=True)
 
     with TestClient(app) as test_client:
         yield test_client
+
+    reset_writer()
 
 
 def _jpeg() -> bytes:
@@ -303,3 +310,104 @@ def test_stage_is_mirrored_into_stored_result(client: TestClient) -> None:
 
     result = client.get(f"/api/v1/analyses/{analysis_id}/result").json()
     assert result["stage"] == "done"
+
+
+def test_gemini_advisory_pipeline_conforms_to_contract(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When Gemini Flash is configured and succeeds, the result uses generatedBy='llm'."""
+    import asyncio
+    import json
+    from types import SimpleNamespace
+
+    from app.jobs import pipeline
+    from app.vision import VisionFacts
+
+    gemini_spoken = (
+        "আপনার ধান গাছে ব্লাস্ট রোগের লক্ষণ দেখা যাচ্ছে। "
+        "প্রাথমিকভাবে ট্রাইসাইক্লাজল স্প্রে করার আগে স্থানীয় কৃষি কর্মকর্তার পরামর্শ নিন। "
+        "স্প্রে করার সময় গ্লাভস ও মাস্ক পরুন এবং কাজ শেষে হাত ধুয়ে নিন। এটি একটি আনুমানিক পরামর্শ।"
+    )
+
+    async def fake_classify(self, image_path, crop_id):
+        return VisionFacts(
+            status="identified",
+            label="rice_blast",
+            confidence=0.91,
+            crop_id="rice",
+            disease_id="rice_blast",
+            model="efficientnet",
+        )
+
+    class StubModels:
+        def generate_content(self, **_kwargs):
+            return SimpleNamespace(text=json.dumps({"spoken": gemini_spoken}, ensure_ascii=False))
+
+    stub_writer = GeminiWriter.__new__(GeminiWriter)
+    stub_writer._semaphore = asyncio.Semaphore(3)
+    stub_writer._client = SimpleNamespace(models=StubModels())
+
+    monkeypatch.setattr(settings, "vision_enabled", True)
+    monkeypatch.setattr(
+        pipeline.get_classifier().__class__, "classify", fake_classify, raising=False
+    )
+    monkeypatch.setattr(settings, "gemini_api_key", "test-key-not-real")
+    monkeypatch.setattr("app.llm.writer.GeminiWriter", lambda: stub_writer)
+    reset_writer()
+
+    health = client.get("/api/v1/health").json()
+    assert health["llm"] == "ready"
+    assert health["status"] == "ok"
+
+    created = client.post(
+        "/api/v1/analyses",
+        files={"image": ("crop.jpg", _jpeg(), "image/jpeg")},
+        data={"crop": "rice"},
+    )
+    assert created.status_code == 202
+    analysis_id = created.json()["id"]
+    summary = _wait(client, analysis_id)
+    assert summary["status"] == "completed"
+
+    payload = client.get(f"/api/v1/analyses/{analysis_id}/result").json()
+    validated = AnalysisResult.model_validate(payload)
+    assert validated.generatedBy == "llm"
+    assert "ট্রাইসাইক্লাজল" in validated.narrative
+    assert "আনুমানিক পরামর্শ" in validated.narrative
+
+
+def test_gemini_failure_falls_back_to_template_conforming_to_contract(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """If Gemini fails at runtime, the pipeline degrades cleanly to template fallback."""
+    from types import SimpleNamespace
+
+    class FailingModels:
+        def generate_content(self, **_kwargs):
+            raise RuntimeError("upstream unavailable")
+
+    stub_writer = GeminiWriter.__new__(GeminiWriter)
+    import asyncio
+
+    stub_writer._semaphore = asyncio.Semaphore(3)
+    stub_writer._client = SimpleNamespace(models=FailingModels())
+
+    monkeypatch.setattr(settings, "gemini_api_key", "test-key-not-real")
+    monkeypatch.setattr("app.llm.writer.GeminiWriter", lambda: stub_writer)
+    reset_writer()
+
+    created = client.post(
+        "/api/v1/analyses",
+        files={"image": ("crop.jpg", _jpeg(), "image/jpeg")},
+        data={"crop": "rice"},
+    )
+    assert created.status_code == 202
+    analysis_id = created.json()["id"]
+    summary = _wait(client, analysis_id)
+    assert summary["status"] == "completed"
+
+    payload = client.get(f"/api/v1/analyses/{analysis_id}/result").json()
+    validated = AnalysisResult.model_validate(payload)
+    assert validated.generatedBy == "template"
+    assert validated.narrative
+    assert "আনুমানিক" in validated.narrative

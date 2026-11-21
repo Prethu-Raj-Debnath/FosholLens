@@ -1,1 +1,0 @@
-"""FosholLens FastAPI backend package."""

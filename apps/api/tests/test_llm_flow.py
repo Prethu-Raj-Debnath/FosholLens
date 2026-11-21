@@ -14,7 +14,14 @@ from types import SimpleNamespace
 import pytest
 
 from app.llm import writer as writer_module
-from app.llm.writer import InvalidNarrative, LlmWriter, TemplateWriter, get_writer, reset_writer
+from app.llm.writer import (
+    GeminiWriter,
+    InvalidNarrative,
+    LlmWriter,
+    TemplateWriter,
+    get_writer,
+    reset_writer,
+)
 
 FACTS = {
     "diagnosis": {"crop": "ধান", "disease": "ব্লাস্ট রোগ", "confidence": "মাঝারি"},
@@ -185,6 +192,8 @@ async def test_template_writer_mentions_weather_only_when_present() -> None:
 
 
 def test_writer_selection_falls_back_without_a_key(monkeypatch) -> None:
+    monkeypatch.setattr(writer_module.settings, "llm_provider", "auto")
+    monkeypatch.setattr(writer_module.settings, "gemini_api_key", "")
     monkeypatch.setattr(writer_module.settings, "llm_api_key", "")
     reset_writer()
     try:
@@ -193,11 +202,129 @@ def test_writer_selection_falls_back_without_a_key(monkeypatch) -> None:
         reset_writer()
 
 
-def test_writer_selection_uses_llm_when_configured(monkeypatch) -> None:
+def test_writer_selection_uses_gemini_when_gemini_or_llm_key_configured(monkeypatch) -> None:
+    monkeypatch.setattr(writer_module.settings, "llm_provider", "auto")
+    monkeypatch.setattr(writer_module.settings, "gemini_api_key", "test-key-not-real")
+    monkeypatch.setattr(writer_module.settings, "llm_api_key", "")
+    reset_writer()
+    try:
+        assert isinstance(get_writer(), GeminiWriter)
+    finally:
+        reset_writer()
+
+    monkeypatch.setattr(writer_module.settings, "gemini_api_key", "")
+    monkeypatch.setattr(writer_module.settings, "llm_api_key", "test-key-not-real")
+    reset_writer()
+    try:
+        assert isinstance(get_writer(), GeminiWriter)
+    finally:
+        reset_writer()
+
+
+def test_writer_selection_uses_openai_when_explicitly_selected(monkeypatch) -> None:
+    monkeypatch.setattr(writer_module.settings, "llm_provider", "openai")
+    monkeypatch.setattr(writer_module.settings, "gemini_api_key", "")
     monkeypatch.setattr(writer_module.settings, "llm_api_key", "test-key-not-real")
     reset_writer()
     try:
         assert isinstance(get_writer(), LlmWriter)
     finally:
-        writer_module.settings.llm_api_key = ""
         reset_writer()
+
+
+class StubGeminiModels:
+    """Records Gemini generate_content calls and replays queued responses."""
+
+    def __init__(self, responses):
+        self._responses = list(responses)
+        self.calls: list[dict] = []
+
+    def generate_content(self, **kwargs):
+        self.calls.append(kwargs)
+        result = self._responses.pop(0)
+        if isinstance(result, Exception):
+            raise result
+        return result
+
+
+def _gemini_writer_with(responses) -> tuple[GeminiWriter, StubGeminiModels]:
+    import asyncio
+
+    writer = GeminiWriter.__new__(GeminiWriter)
+    writer._semaphore = asyncio.Semaphore(3)
+    models = StubGeminiModels(responses)
+    writer._client = SimpleNamespace(models=models)
+    return writer, models
+
+
+async def test_gemini_good_output_is_accepted() -> None:
+    writer, models = _gemini_writer_with(
+        [SimpleNamespace(text=json.dumps({"spoken": GOOD_SPOKEN}, ensure_ascii=False))]
+    )
+    text, generated_by = await writer.write(FACTS)
+
+    assert generated_by == "llm"
+    assert "ট্রাইসাইক্লাজল" in text
+    assert models.calls[0]["model"] == "gemini-3.8-flash"
+
+
+async def test_gemini_fallback_models_on_retryable_status_codes(monkeypatch) -> None:
+    from google.genai import errors as genai_errors
+
+    monkeypatch.setattr(writer_module.settings, "gemini_model", "gemini-3.8-flash")
+    writer, models = _gemini_writer_with(
+        [
+            genai_errors.APIError(404, {"error": {"message": "not found"}}),
+            genai_errors.APIError(429, {"error": {"message": "rate limited"}}),
+            genai_errors.APIError(503, {"error": {"message": "overloaded"}}),
+            SimpleNamespace(text=json.dumps({"spoken": GOOD_SPOKEN}, ensure_ascii=False)),
+        ]
+    )
+    text, generated_by = await writer.write(FACTS)
+
+    assert generated_by == "llm"
+    assert "ট্রাইসাইক্লাজল" in text
+    assert [call["model"] for call in models.calls] == [
+        "gemini-3.8-flash",
+        "gemini-3.7-flash",
+        "gemini-3.5-flash",
+        "gemini-3.5-flash-lite",
+    ]
+
+
+async def test_gemini_non_retryable_api_error_propagates_immediately(monkeypatch) -> None:
+    from google.genai import errors as genai_errors
+
+    monkeypatch.setattr(writer_module.settings, "gemini_model", "gemini-3.8-flash")
+    writer, models = _gemini_writer_with(
+        [genai_errors.APIError(400, {"error": {"message": "bad request"}})]
+    )
+    with pytest.raises(genai_errors.APIError):
+        await writer.write(FACTS)
+    assert len(models.calls) == 1
+
+
+async def test_gemini_invalid_narrative_retries_once_then_succeeds() -> None:
+    writer, models = _gemini_writer_with(
+        [
+            SimpleNamespace(text=json.dumps({"spoken": "ধান"}, ensure_ascii=False)),
+            SimpleNamespace(text=json.dumps({"spoken": GOOD_SPOKEN}, ensure_ascii=False)),
+        ]
+    )
+    text, generated_by = await writer.write(FACTS)
+
+    assert generated_by == "llm"
+    assert "ট্রাইসাইক্লাজল" in text
+    assert len(models.calls) == 2
+    assert "আগের উত্তরটি নিয়ম মানেনি" in models.calls[1]["contents"]
+
+
+async def test_gemini_two_bad_answers_raise_for_fallback() -> None:
+    writer, _ = _gemini_writer_with(
+        [
+            SimpleNamespace(text=json.dumps({"spoken": "ধান"}, ensure_ascii=False)),
+            SimpleNamespace(text=json.dumps({"spoken": "ধান Mancozeb"}, ensure_ascii=False)),
+        ]
+    )
+    with pytest.raises(InvalidNarrative, match="unusable_after_retry"):
+        await writer.write(FACTS)
