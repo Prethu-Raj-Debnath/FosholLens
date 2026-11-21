@@ -154,16 +154,40 @@ tapped.
 
 ## 4. Stage 1 — Vision (built, narrow)
 
-`vision/classifier.py` runs `wambugu71/crop_leaf_diseases_vit`, exported to ONNX
-and served through `onnxruntime` — already a dependency, so this adds no install
-weight. Weights download once (22 MB) on first use, like the TTS model. Measured
-on this box: 0.20 s to open the graph, 0.14 s per image, CPU only.
+`vision/classifier.py` runs one of two ONNX checkpoints, served through
+`onnxruntime` — already a dependency, so neither adds install weight. Which one
+is selected with `VISION_MODEL`; everything else that differs between them lives
+in `vision/models.py` as a spec, so the _decision rule is shared_. They cannot
+drift apart in when they refuse, only in what they can name.
+
+| `VISION_MODEL` | Arch                 | Classes | Crops                     | Size  | Latency  | Source          |
+| -------------- | -------------------- | ------- | ------------------------- | ----- | -------- | --------------- |
+| `efficientnet` | EfficientNet-B0      | 9       | rice, potato              | 16 MB | 28–49 ms | local `models/` |
+| `vit`          | ViT-tiny patch16-224 | 13      | corn, potato, rice, wheat | 22 MB | ~140 ms  | Hugging Face    |
+
+Measured on this box, CPU only. `efficientnet` is the default: it is faster, and
+it is the only one that can name rice bacterial leaf blight — a disease the
+knowledge base has curated treatment for. `vit` can recognise corn and wheat,
+which the knowledge base has nothing to say about, so that coverage is mostly
+inert; it is kept as an option because a wrong-crop refusal ("that looks like
+corn") is occasionally more useful than "I don't know".
+
+Neither checkpoint's bytes are committed: `apps/api/models/` is gitignored, and
+the `vit` weights are fetched on first use. A missing local file degrades the
+stage to `unavailable` with a message naming the path it looked in, rather than
+failing the whole job.
 
 **Why ONNX and not `transformers`:** the upstream PyTorch path costs a ~900 MB
-`torch` wheel for a 22 MB model. The ONNX export produces identical logits from
-the same weights with no torch at all.
+`torch` wheel for a 16–22 MB model. The ONNX exports produce the same logits
+from the same weights with no torch at all.
 
-**Threshold placement is the whole safety story.** The model emits 13 logits
+**Preprocessing is part of the model contract.** The two checkpoints disagree on
+input size (320 vs 224), normalisation (ImageNet mean/std vs 0.5/0.5) and the
+ONNX input node name (`input` vs `pixel_values`). Getting any of those wrong
+does not raise — it silently degrades accuracy — which is why they live in the
+spec next to the label list rather than as module constants.
+
+**Threshold placement is the whole safety story.** The model emits one logit per class
 across corn, potato, rice, wheat and an `Invalid` class. The tempting shortcut is
 to filter to the requested crop's classes, renormalise, then threshold. That is
 wrong: a corn leaf asked about as rice still yields a rice class at ~0.75 _after_
@@ -183,9 +207,20 @@ Refusal is the default. `undetermined` is returned for any of:
 | label has no KB entry          | no curated dose exists; inventing one is the failure |
 | model unavailable / unreadable | no evidence at all                                   |
 
-Only three labels resolve: rice leaf blast, potato early blight, potato late
-blight. Everything else — including a correctly-named rice brown spot — falls
-back to the per-crop curated entry and is marked unconfirmed.
+Resolvable labels, per checkpoint:
+
+| Disease               | `efficientnet` | `vit` |
+| --------------------- | -------------- | ----- |
+| rice leaf blast       | yes            | yes   |
+| rice bacterial blight | **yes**        | no    |
+| potato early blight   | yes            | yes   |
+| potato late blight    | yes            | yes   |
+
+Everything else — including a correctly-named rice brown spot or tungro — falls
+back to the per-crop curated entry and is marked unconfirmed. The `efficientnet`
+checkpoint spells its class `rice_bacterial_leaf_blight` while the KB id is
+`rice_bacterial_blight`; the mapping is explicit rather than string surgery, and
+a test asserts every mapped id exists in the knowledge base.
 
 **What the unconfirmed path does and does not do.** It keeps the crop's organic
 care steps and its source, and it withholds every chemical dose, because a dose
@@ -659,6 +694,12 @@ LLM_API_KEY=                          # leave empty to use the template writer
 LLM_MODEL=openai/gpt-6-luna
 LLM_TIMEOUT_MS=15000
 LLM_MAX_CONCURRENCY=3                 # provider caps at 3 without a plan
+
+# ---- vision ----
+VISION_ENABLED=true
+VISION_MODEL=efficientnet             # or: vit
+VISION_MODEL_DIR=./models             # local checkpoint lives here (gitignored)
+VISION_CONFIDENCE_THRESHOLD=0.55      # raw softmax, before any crop filtering
 
 # ---- TTS ----
 TTS_ENABLED=true

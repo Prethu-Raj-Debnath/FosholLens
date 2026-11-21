@@ -37,8 +37,14 @@ class Settings(BaseSettings):
 
     # ---- vision (optional: without a model every diagnosis is unconfirmed)
     vision_enabled: bool = True
-    vision_model_id: str = "wambugu71/crop_leaf_diseases_vit_onnx"
-    vision_model_file: str = "crop_leaf_diseases_vit.onnx"
+    #: Which checkpoint to use.
+    #:   vit          - 13 classes, corn/potato/rice/wheat, downloaded from HF.
+    #:   efficientnet - 9 classes, rice/potato only, local file, ~3x faster.
+    #: Everything else that differs between them (label order, crop mapping,
+    #: preprocessing) lives in `vision/models.py`, so this is the only switch.
+    vision_model: Literal["vit", "efficientnet"] = "efficientnet"
+    #: Where a local checkpoint lives. Unused when the spec names a Hub repo.
+    vision_model_dir: Path = API_ROOT / "models"
     #: Raw softmax probability below which a leaf is "not confidently
     #: identified". Applied before any crop filtering, so a wrong-crop photo
     #: cannot be renormalised into a confident answer.

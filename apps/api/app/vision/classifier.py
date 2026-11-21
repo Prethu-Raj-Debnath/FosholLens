@@ -1,87 +1,32 @@
 """Leaf disease classification.
 
-A ViT fine-tuned on corn/potato/rice/wheat leaves, run through `onnxruntime`.
+Two interchangeable checkpoints, chosen with `VISION_MODEL`:
 
-Why ONNX and not `transformers`: the model ships both, but the PyTorch path
-costs a ~900 MB torch wheel for a 22 MB model. `onnxruntime` is already a
-dependency here (it powers the TTS engine), so this adds no install weight and
-the weights download lazily on first use, like the TTS model does.
+* `vit`          - ViT-tiny, 13 classes, corn/potato/rice/wheat, fetched from
+                   Hugging Face on first use (22 MB).
+* `efficientnet` - EfficientNet-B0, 9 classes, rice/potato only, loaded from
+                   `VISION_MODEL_DIR` (16 MB, no download).
+
+Both run through `onnxruntime`, which is already a dependency here (it powers
+the TTS engine), so neither adds install weight. The PyTorch path the upstream
+checkpoints ship was not used: it costs a ~900 MB `torch` wheel for a 22 MB
+model.
+
+The decision rule below is shared. Only the spec differs, so the two models
+cannot drift apart in *when they refuse* — just in what they can name.
 """
 
 from __future__ import annotations
 
 import asyncio
-import io
 import logging
 from pathlib import Path
 from typing import Any, Literal, TypedDict
 
 from ..config import settings
+from .models import ModelSpec, get_spec
 
 log = logging.getLogger(__name__)
-
-#: Emission order of the model's 13 classes. Fixed by the exported graph: the
-#: output tensor is `[batch, 13]` with no label metadata attached, so this order
-#: is part of the model's contract, not a guess. It matches `id2label` in the
-#: upstream `config.json`.
-LABELS: tuple[str, ...] = (
-    "Corn___Common_Rust",
-    "Corn___Gray_Leaf_Spot",
-    "Corn___Healthy",
-    "Invalid",
-    "Potato___Early_Blight",
-    "Potato___Healthy",
-    "Potato___Late_Blight",
-    "Rice___Brown_Spot",
-    "Rice___Healthy",
-    "Rice___Leaf_Blast",
-    "Wheat___Brown_Rust",
-    "Wheat___Healthy",
-    "Wheat___Yellow_Rust",
-)
-
-#: Model label -> the crop that label belongs to.
-LABEL_CROP: dict[str, str] = {
-    "Corn___Common_Rust": "corn",
-    "Corn___Gray_Leaf_Spot": "corn",
-    "Corn___Healthy": "corn",
-    "Potato___Early_Blight": "potato",
-    "Potato___Healthy": "potato",
-    "Potato___Late_Blight": "potato",
-    "Rice___Brown_Spot": "rice",
-    "Rice___Healthy": "rice",
-    "Rice___Leaf_Blast": "rice",
-    "Wheat___Brown_Rust": "wheat",
-    "Wheat___Healthy": "wheat",
-    "Wheat___Yellow_Rust": "wheat",
-}
-
-#: Model label -> curated knowledge-base entry.
-#:
-#: Deliberately incomplete. The model can name `Rice___Brown_Spot`, but the
-#: knowledge base has no curated treatment for it, and inventing a dose for a
-#: disease we have no source for is exactly the failure this project exists to
-#: avoid. Unmapped labels degrade to "not confidently identified" instead.
-LABEL_DISEASE: dict[str, str] = {
-    "Rice___Leaf_Blast": "rice_blast",
-    "Potato___Early_Blight": "potato_early_blight",
-    "Potato___Late_Blight": "potato_late_blight",
-}
-
-HEALTHY_LABELS = frozenset(
-    {"Corn___Healthy", "Potato___Healthy", "Rice___Healthy", "Wheat___Healthy"}
-)
-
-#: A leaf that is genuinely healthy would land here; so would a photo the model
-#: cannot place. Neither is a diagnosis.
-NON_DIAGNOSTIC_LABELS = frozenset({"Invalid"}) | HEALTHY_LABELS
-
-#: Crops this model can say anything about at all.
-SUPPORTED_CROPS = frozenset({"rice", "potato"})
-
-INPUT_SIZE = 224
-IMAGE_MEAN = 0.5
-IMAGE_STD = 0.5
 
 VisionStatus = Literal["identified", "undetermined", "unavailable"]
 
@@ -91,42 +36,49 @@ class VisionFacts(TypedDict):
 
     status: VisionStatus
     label: str | None
-    #: Softmax probability of the winning class, over all 13 classes.
+    #: Softmax probability of the winning class, over the model's full label set.
     confidence: float | None
     crop_id: str | None
     disease_id: str | None
+    #: Which checkpoint produced this, so a stored result stays interpretable
+    #: after `VISION_MODEL` changes.
+    model: str | None
 
 
 class LeafClassifier:
-    """Lazy, serialised ONNX inference.
+    """Lazy, serialised ONNX inference for one checkpoint.
 
-    `onnxruntime` sessions are thread-safe for `run`, but `_session` construction
-    is not, so loading takes the same lock the TTS engine uses for its weights.
+    `onnxruntime` sessions are thread-safe for `run`, but construction is not,
+    so loading takes a lock — the same pattern the TTS engine uses for its
+    weights.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, spec: ModelSpec | None = None) -> None:
+        self._spec = spec if spec is not None else get_spec(settings.vision_model)
         self._session: Any = None
         self._load_lock = asyncio.Lock()
+
+    @property
+    def spec(self) -> ModelSpec:
+        return self._spec
 
     @property
     def available(self) -> bool:
         return settings.vision_enabled
 
     def _load(self) -> Any:
-        """Download (once) and open the ONNX graph. Blocking."""
+        """Open the ONNX graph, downloading the weights if the spec says so."""
         import onnxruntime as ort
-        from huggingface_hub import hf_hub_download
 
-        path = hf_hub_download(
-            settings.vision_model_id,
-            filename=settings.vision_model_file,
-        )
+        path = _resolve_weights(self._spec)
         session = ort.InferenceSession(
             str(path),
             providers=["CPUExecutionProvider"],
             sess_options=_session_options(ort),
         )
-        log.info("vision model loaded: %s", settings.vision_model_id)
+        log.info(
+            "vision model loaded: %s (%d classes)", self._spec["id"], len(self._spec["labels"])
+        )
         return session
 
     async def ensure_loaded(self) -> None:
@@ -144,7 +96,7 @@ class LeafClassifier:
         without withholding the curated advice behind it.
         """
         if not self.available:
-            return _unavailable()
+            return _unavailable(self._spec)
 
         try:
             await self.ensure_loaded()
@@ -156,26 +108,46 @@ class LeafClassifier:
                 exc.__class__.__name__,
                 str(exc) or "no detail",
             )
-            return _unavailable()
+            return _unavailable(self._spec)
 
     def _classify_sync(self, image_path: Path, crop_id: str) -> VisionFacts:
-        import numpy as np
         from PIL import Image
 
+        spec = self._spec
         try:
             with Image.open(image_path) as opened:
                 image = opened.convert("RGB").resize(
-                    (INPUT_SIZE, INPUT_SIZE), Image.Resampling.BICUBIC
+                    (spec["input_size"], spec["input_size"]), Image.Resampling.BILINEAR
                 )
         except Exception as exc:  # noqa: BLE001
             log.warning("vision image unreadable: %s", exc.__class__.__name__)
-            return _unavailable()
+            return _unavailable(spec)
 
-        batch = _to_tensor(np, image)
-        logits = self._session.run(None, {"pixel_values": batch})[0][0]
+        batch = _to_tensor(image, spec)
+        logits = self._session.run(None, {spec["input_name"]: batch})[0][0]
+        return _decide(_softmax(logits), crop_id, spec)
 
-        probabilities = _softmax(np, logits)
-        return _decide(probabilities, crop_id)
+
+def _resolve_weights(spec: ModelSpec) -> Path:
+    """Find the checkpoint's bytes.
+
+    A spec with a Hub repo is downloaded (and cached) on first use. A spec
+    without one is a team-trained artifact: it must already be on disk, so a
+    missing file raises here naming the path it looked in rather than failing
+    later inside onnxruntime.
+    """
+    if spec["hf_repo"]:
+        from huggingface_hub import hf_hub_download
+
+        return Path(hf_hub_download(spec["hf_repo"], filename=spec["file"]))
+
+    path = Path(settings.vision_model_dir) / spec["file"]
+    if not path.exists():
+        raise FileNotFoundError(
+            f"vision model not found at {path}; put {spec['file']} there, or set "
+            f"VISION_MODEL_DIR to the directory containing it"
+        )
+    return path
 
 
 def _session_options(ort: Any) -> Any:
@@ -187,24 +159,32 @@ def _session_options(ort: Any) -> Any:
     return options
 
 
-def _to_tensor(np: Any, image: Any) -> Any:
-    """HWC uint8 -> NCHW float32, rescaled 1/255 then normalised by 0.5/0.5.
+def _to_tensor(image: Any, spec: ModelSpec) -> Any:
+    """HWC uint8 -> NCHW float32, rescaled then normalised per the checkpoint.
 
-    Matches the model's `preprocessor_config.json`; getting this wrong does not
-    error, it just quietly degrades accuracy.
+    Getting mean/std or the input size wrong does not raise; it quietly degrades
+    accuracy. That is why they live in the spec next to the label list.
     """
+    import numpy as np
+
+    size = spec["input_size"]
     array = np.asarray(image, dtype=np.float32) / 255.0
-    array = (array - IMAGE_MEAN) / IMAGE_STD
+    mean = np.array(spec["mean"], dtype=np.float32)
+    std = np.array(spec["std"], dtype=np.float32)
+    array = (array - mean) / std
+    assert array.shape[:2] == (size, size)  # noqa: S101 - preprocessing contract
     return np.ascontiguousarray(array.transpose(2, 0, 1)[None])
 
 
-def _softmax(np: Any, logits: Any) -> Any:
+def _softmax(logits: Any) -> Any:
+    import numpy as np
+
     shifted = logits - logits.max()
     exponents = np.exp(shifted)
     return exponents / exponents.sum()
 
 
-def _decide(probabilities: Any, crop_id: str) -> VisionFacts:
+def _decide(probabilities: Any, crop_id: str, spec: ModelSpec) -> VisionFacts:
     """Turn probabilities into facts, applying the threshold to raw mass.
 
     The threshold is deliberately compared against the *unfiltered* probability
@@ -215,24 +195,24 @@ def _decide(probabilities: Any, crop_id: str) -> VisionFacts:
     was a different crop.
     """
     index = int(probabilities.argmax())
-    label = LABELS[index]
+    label = spec["labels"][index]
     confidence = float(probabilities[index])
 
     if confidence < settings.vision_confidence_threshold:
-        return _undetermined(label, confidence)
+        return _undetermined(label, confidence, spec)
 
-    if label in NON_DIAGNOSTIC_LABELS:
-        return _undetermined(label, confidence)
+    if label in spec["non_diagnostic"] or label in spec["healthy"]:
+        return _undetermined(label, confidence, spec)
 
-    label_crop = LABEL_CROP.get(label)
+    label_crop = spec["label_crop"].get(label)
     if label_crop != crop_id:
-        # Wrong crop in frame, or a crop this model cannot name. Either way the
-        # answer says nothing about the leaf the farmer actually photographed.
-        return _undetermined(label, confidence)
+        # Wrong crop in frame, or a crop this checkpoint cannot name. Either way
+        # the answer says nothing about the leaf the farmer photographed.
+        return _undetermined(label, confidence, spec)
 
-    disease_id = LABEL_DISEASE.get(label)
+    disease_id = spec["label_disease"].get(label)
     if disease_id is None:
-        return _undetermined(label, confidence)
+        return _undetermined(label, confidence, spec)
 
     return VisionFacts(
         status="identified",
@@ -240,26 +220,29 @@ def _decide(probabilities: Any, crop_id: str) -> VisionFacts:
         confidence=confidence,
         crop_id=label_crop,
         disease_id=disease_id,
+        model=spec["id"],
     )
 
 
-def _undetermined(label: str | None, confidence: float | None) -> VisionFacts:
+def _undetermined(label: str | None, confidence: float | None, spec: ModelSpec) -> VisionFacts:
     return VisionFacts(
         status="undetermined",
         label=label,
         confidence=confidence,
         crop_id=None,
         disease_id=None,
+        model=spec["id"],
     )
 
 
-def _unavailable() -> VisionFacts:
+def _unavailable(spec: ModelSpec | None = None) -> VisionFacts:
     return VisionFacts(
         status="unavailable",
         label=None,
         confidence=None,
         crop_id=None,
         disease_id=None,
+        model=spec["id"] if spec else None,
     )
 
 
@@ -277,8 +260,3 @@ def reset_classifier() -> None:
     """Drop the cached model. Used by tests after changing settings."""
     global _engine
     _engine = None
-
-
-def image_bytes_to_path_source(raw: bytes) -> io.BytesIO:  # pragma: no cover
-    """Kept for symmetry with callers that hold bytes rather than a path."""
-    return io.BytesIO(raw)
