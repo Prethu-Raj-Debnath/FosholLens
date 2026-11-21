@@ -1,16 +1,31 @@
 """FastAPI entrypoint for FosholLens backend."""
 
+import logging
 import os
+from pathlib import Path
 from typing import Optional
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 
-from app import llm, rag, tts, vision, weather
-from app.schemas import AnalyzeResponse, CropType, HealthResponse
+from app import llm, tts, vision
+from app.schemas import (
+    AnalyzeResponse,
+    CropType,
+    HealthResponse,
+    Location,
+    RagSource,
+    WeatherResult,
+)
 
+# Load .env from repo root first (if present), then current working directory
+_ROOT_ENV = Path(__file__).resolve().parents[2] / ".env"
+if _ROOT_ENV.exists():
+    load_dotenv(_ROOT_ENV)
 load_dotenv()
+
+logger = logging.getLogger(__name__)
 
 DEFAULT_LAT = 23.4607  # Cumilla, Bangladesh
 DEFAULT_LNG = 91.1809  # Cumilla, Bangladesh
@@ -18,7 +33,7 @@ DEFAULT_LNG = 91.1809  # Cumilla, Bangladesh
 app = FastAPI(
     title="FosholLens API",
     description="Multimodal Bangla Voice & Weather-Aware Crop Advisory for Rice and Potato",
-    version="0.1.0",
+    version="0.2.0",
 )
 
 cors_origins_env = os.getenv("CORS_ORIGINS", "")
@@ -65,10 +80,10 @@ async def analyze_crop(
         default=DEFAULT_LNG, description="Longitude (defaults to Cumilla: 91.1809)"
     ),
 ) -> AnalyzeResponse:
-    """Run the multimodal crop advisory pipeline.
+    """Run the Day 1 end-to-end multimodal crop advisory pipeline.
 
-    Returns HTTP 501 (Not Implemented) until the underlying AI/weather/RAG/TTS
-    modules are implemented. Never fabricates diagnoses or advisories.
+    Pipeline: Image -> ViT Vision Classifier -> Gemini Flash Bangla Advisory -> Bangla TTS.
+    Weather 48h guard and BARI/BRRI RAG are scheduled for Day 2.
     """
     image_bytes = await image.read()
     if not image_bytes:
@@ -78,40 +93,51 @@ async def analyze_crop(
     resolved_lat = DEFAULT_LAT if lat is None else lat
     resolved_lng = DEFAULT_LNG if lng is None else lng
 
+    # 1. Vision Classification (Hugging Face ViT)
     try:
         vision_result = await vision.classify_leaf(
             image_bytes=image_bytes,
             crop=crop,
             content_type=image.content_type,
         )
-        weather_result = await weather.get_spray_windows(
-            lat=resolved_lat,
-            lng=resolved_lng,
-        )
-        top_label = (
-            vision_result.top_predictions[0].label
-            if vision_result.top_predictions
-            else "unknown"
-        )
-        rag_sources = await rag.retrieve_guidance(
-            crop=crop,
-            disease_label=top_label,
-            question_text=question_text,
-        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.exception("Vision inference failed.")
+        raise HTTPException(
+            status_code=500, detail=f"Vision classification error: {exc}"
+        ) from exc
+
+    # 2. Temporary empty WeatherResult & RAG sources (Day 2)
+    weather_result = WeatherResult(
+        location=Location(lat=resolved_lat, lng=resolved_lng),
+        next_48h_windows=[],
+        safest_window_summary="Weather guard pending (Day 2)",
+    )
+    rag_sources: list[RagSource] = []
+
+    # 3. Gemini Flash Bangla Advisory
+    try:
         advisory_result = await llm.generate_advisory(
             crop=crop,
             vision=vision_result,
-            weather=weather_result,
+            weather=None,
             rag_sources=rag_sources,
             audio_bytes=audio_bytes,
             audio_content_type=audio.content_type if audio is not None else None,
             question_text=question_text,
         )
-        audio_output = await tts.synthesize_bangla_speech(
-            bangla_text=advisory_result.bangla_text
-        )
-    except NotImplementedError as exc:
-        raise HTTPException(status_code=501, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        logger.error("Advisory generation configuration/runtime error: %s", exc)
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.exception("Gemini advisory generation failed.")
+        raise HTTPException(
+            status_code=502, detail=f"Bangla advisory generation failed: {exc}"
+        ) from exc
+
+    # 4. Bangla TTS (gracefully returns None on failure)
+    audio_output = await tts.synthesize_bangla_audio(advisory_result.bangla_text)
 
     return AnalyzeResponse(
         crop=crop,
