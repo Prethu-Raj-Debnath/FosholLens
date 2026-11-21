@@ -34,8 +34,8 @@ The backend runs a 4-stage asynchronous job pipeline (`reading -> grounding -> w
 
 1. **Image Preparation & Privacy (`apps/frontend` & `apps/api/app/routes.py`):** Images are downscaled to `1280px` max edge and re-encoded as JPEG on the server, stripping EXIF metadata so phone GPS coordinates are never stored on disk.
 2. **Stage 1 — Vision (`apps/api/app/vision/`):** Runs local ONNX inference (`onnxruntime`, CPU-only) via `VISION_MODEL`:
-   - `efficientnet` *(default, committed at `apps/api/models/foshollens_leaf.onnx`, 16 MB, ~40 ms)*: EfficientNet-B0, 9 classes covering rice and potato (including rice bacterial leaf blight, rice blast, potato early blight, potato late blight).
-   - `vit` *(22 MB, ~140 ms, downloaded from Hugging Face on first use)*: ViT-tiny (`wambugu71/crop_leaf_diseases_vit` ONNX export), 13 classes across corn, potato, rice, and wheat.
+   - `efficientnet` *(the shipped model, committed at `apps/api/models/foshollens_leaf.onnx`, 16 MB, ~40 ms)*: EfficientNet-B0, 9 classes covering rice and potato. Every label is surfaced to the farmer: four rice diseases (blast, bacterial leaf blight, brown spot, tungro), two potato diseases (early and late blight), the two `healthy` classes, and `rice_other`. Only `rice_other` is non-diagnostic — it is the model admitting it cannot name the disease.
+   - `vit` *(deprecated; opt in with `VISION_MODEL=vit`)*: ViT-tiny (`wambugu71/crop_leaf_diseases_vit` ONNX export), 13 classes across corn, potato, rice, and wheat. Its corn and wheat classes have no curated advice, so they resolve to "no answer". Not the default and not required.
    - Threshold (`VISION_CONFIDENCE_THRESHOLD=0.55`) is applied to raw softmax probabilities *before* crop filtering so wrong-crop photos cannot be inflated into false positives.
 3. **Stage 2 — Grounding (`apps/api/app/grounding/`):** Looks up curated disease management data from BRRI and BARI knowledge-base entries (`knowledge_base.py`) and fetches hourly Open-Meteo weather forecasts for the farmer's selected district (`districts.py`, `weather.py`) to compute the deterministic spray verdict.
 4. **Stage 3 — Bangla Advisory (`apps/api/app/llm/writer.py`):**
@@ -52,8 +52,8 @@ The backend runs a 4-stage asynchronous job pipeline (`reading -> grounding -> w
 - **Shared Contracts (`packages/contracts`):** Pydantic models (`apps/api/app/contracts.py`) mirrored in TypeScript/Zod (`@foshol-lens/contracts`)
 - **Backend (`apps/api`):** Python 3.12+, FastAPI, Uvicorn, Pydantic v2, `aiosqlite` (SQLite WAL), HTTPX, Pillow, `onnxruntime`, `huggingface-hub`
 - **Vision Models:**
-  - Committed EfficientNet-B0 ONNX checkpoint (`apps/api/models/foshollens_leaf.onnx`, 9 classes for Rice & Potato)
-  - Selectable Hugging Face Vision Transformer [`wambugu71/crop_leaf_diseases_vit`](https://huggingface.co/wambugu71/crop_leaf_diseases_vit) (`wambugu71/crop_leaf_diseases_vit_onnx`, 13 classes)
+  - Shipped EfficientNet-B0 ONNX checkpoint (`apps/api/models/foshollens_leaf.onnx`, 9 classes for Rice & Potato) — the main model
+  - Deprecated fallback: Hugging Face Vision Transformer [`wambugu71/crop_leaf_diseases_vit`](https://huggingface.co/wambugu71/crop_leaf_diseases_vit) (`wambugu71/crop_leaf_diseases_vit_onnx`, 13 classes)
 - **LLM Advisory:** Google Gemini Flash via `google-genai` SDK (`gemini-3.8-flash` primary with `gemini-3.7-flash` / `gemini-3.5-flash` / `gemini-3.5-flash-lite` fallback; optional OpenAI-compatible `openai` SDK support)
 - **Text-to-Speech:** [`sulabhkatiyar/indic-tiny-tts-bengali`](https://huggingface.co/sulabhkatiyar/indic-tiny-tts-bengali) (local ONNX, CPU) + `ffmpeg` -> Opus *(Note: `edge-tts` `bn-BD-NabanitaNeural` was prototyped on Day 1 and replaced by local ONNX TTS for offline/rural reliability)*
 - **Weather API:** [Open-Meteo Forecast API](https://open-meteo.com/) (key-free, non-commercial use)

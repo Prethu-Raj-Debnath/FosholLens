@@ -46,6 +46,7 @@ class Settings(BaseSettings):
     #:   efficientnet - 9 classes, rice/potato only, local file, ~3x faster.
     #: Everything else that differs between them (label order, crop mapping,
     #: preprocessing) lives in `vision/models.py`, so this is the only switch.
+    #: `efficientnet` is the shipped model; `vit` is deprecated and opt-in.
     vision_model: Literal["vit", "efficientnet"] = "efficientnet"
     #: Where a local checkpoint lives. Unused when the spec names a Hub repo.
     vision_model_dir: Path = API_ROOT / "models"

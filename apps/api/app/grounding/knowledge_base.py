@@ -4,6 +4,12 @@ This is the only component allowed to state a fact: a disease name, a symptom, a
 medicine, a dose. The LLM rewrites prose around these entries and is validated
 against them; it never invents one.
 
+Scope is rice and potato only. Those are the two crops the shipped EfficientNet
+checkpoint can actually name, so they are the two crops the app offers. Tomato
+and chili were carried here while the ViT checkpoint was the primary model; they
+have no class in the main checkpoint, so every photo of them could only ever be
+answered with "could not identify". Offering them was a dead end, not a feature.
+
 Every `chemical` entry carries a Bangla transliteration of the active ingredient
 (`bnName`) as well as the Latin one. That is not cosmetic: the TTS model silently
 deletes Latin-script spans, so a Latin-only product name would vanish from the
@@ -41,6 +47,11 @@ class CropEntry(TypedDict):
     id: str
     name: str
     diseases: list[DiseaseEntry]
+
+
+#: The crops this app supports. Anything else is out of scope, and the API
+#: rejects it rather than storing a row it can never give sourced advice for.
+SUPPORTED_CROPS: tuple[str, ...] = ("rice", "potato")
 
 
 KB: list[DiseaseEntry] = [
@@ -113,6 +124,74 @@ KB: list[DiseaseEntry] = [
         ],
         "source": "BRRI - ধানের রোগ ও প্রতিকার",
     },
+    {
+        "id": "rice_brown_spot",
+        "cropId": "rice",
+        "cropName": "ধান",
+        "diseaseLabel": "ধানের বাদামি দাগ রোগ",
+        "bnName": "বাদামি দাগ",
+        "symptoms": [
+            "পাতায় ডিম্বাকৃতি বাদামি দাগ, চারপাশে হলদে আভা",
+            "দাগের মাঝখানে ধূসর রঙ ও ছোট কালো বিন্দু দেখা যায়",
+            "চারার গোড়া পচে চারা শুকিয়ে মরে যায়",
+        ],
+        "organic": [
+            "আক্রান্ত পাতা সংগ্রহ করে জমি থেকে সরিয়ে ফেলুন",
+            "সুষম সার প্রয়োগ করুন, পটাশ ও নাইট্রোজেনের ঘাটতি রাখবেন না",
+            "রোগমুক্ত বীজ ব্যবহার করুন",
+        ],
+        "chemical": [
+            {
+                "product": "Mancozeb",
+                "bnName": "ম্যানকোজেব",
+                "dose": "প্রতি লিটারে ২ গ্রাম",
+                "note": "৭ থেকে ১০ দিন পরপর",
+            },
+            {
+                "product": "Carbendazim",
+                "bnName": "কার্বেন্ডাজিম",
+                "dose": "প্রতি লিটারে ১ গ্রাম",
+                "note": "রোগ বেশি হলে ১০ দিন পরপর",
+            },
+        ],
+        "prevention": [
+            "প্রতিরোধী ধানের জাত বপন করুন",
+            "বীজ বপনের আগে বীজ শোধন করুন",
+            "জমিতে পানি নিষ্কাশনের ব্যবস্থা রাখুন",
+        ],
+        "source": "BRRI - ধানের রোগ ও প্রতিকার",
+    },
+    {
+        "id": "rice_tungro",
+        "cropId": "rice",
+        "cropName": "ধান",
+        "diseaseLabel": "ধানের টুংরো রোগ",
+        "bnName": "টুংরো",
+        "symptoms": [
+            "পাতায় হলদে-কমলা রঙ ছড়িয়ে পড়ে",
+            "গাছ খাটো হয়ে যায় ও কুশি কম হয়",
+            "শীষ ছোট হয় ও চিটা বেশি থাকে",
+        ],
+        "organic": [
+            "আক্রান্ত গাছ তুলে জমি থেকে নষ্ট করে ফেলুন",
+            "সবুজ পাতা ফড়িং নিয়ন্ত্রণে হলুদ আঠালো ফাঁদ ব্যবহার করুন",
+            "আশপাশের জমিতে একই সময়ে ধান রোপণ করুন",
+        ],
+        "chemical": [
+            {
+                "product": "Imidacloprid",
+                "bnName": "ইমিডাক্লোপ্রিড",
+                "dose": "প্রতি লিটারে ০.৩ মিলি",
+                "note": "সবুজ পাতা ফড়িং দমনে ৭ দিন পরপর",
+            },
+        ],
+        "prevention": [
+            "টুংরো প্রতিরোধী ধানের জাত ব্যবহার করুন",
+            "পাতা ফড়িং দেখা দিলে সঙ্গে সঙ্গে ব্যবস্থা নিন",
+            "আগাছা পরিষ্কার রাখুন",
+        ],
+        "source": "BRRI - ধানের রোগ ও প্রতিকার",
+    },
     # ---------------------------------------------------------------- potato --
     {
         "id": "potato_late_blight",
@@ -180,134 +259,64 @@ KB: list[DiseaseEntry] = [
         ],
         "source": "BARI - আলুর রোগ ব্যবস্থাপনা",
     },
-    # ---------------------------------------------------------------- tomato --
-    {
-        "id": "tomato_early_blight",
-        "cropId": "tomato",
-        "cropName": "টমেটো",
-        "diseaseLabel": "টমেটোর আগাম ধসা রোগ",
-        "bnName": "আগাম ধসা",
-        "symptoms": [
-            "নিচের পাতায় ছোট বাদামি দাগ",
-            "দাগ ধীরে ধীরে বড় হয়ে পাতাকে হলদে করে দেয়",
-            "পাতা ঝরে পড়ে গাছ খালি হয়ে যায়",
-        ],
-        "organic": [
-            "আক্রান্ত নিচের পাতা সরিয়ে ফেলুন",
-            "গাছের গোড়ায় খড় বিছিয়ে দিন",
-            "পাতায় পানি জমতে দেবেন না",
-        ],
-        "chemical": [
-            {
-                "product": "Mancozeb",
-                "bnName": "ম্যানকোজেব",
-                "dose": "প্রতি লিটারে ২ গ্রাম",
-                "note": "১০ দিন পরপর",
-            },
-        ],
-        "prevention": [
-            "গাছের মাঝে যথেষ্ট দূরত্ব রাখুন",
-            "ফসল আবর্তন করুন",
-        ],
-        "source": "BARI - টমেটোর রোগ ব্যবস্থাপনা",
-    },
-    {
-        "id": "tomato_late_blight",
-        "cropId": "tomato",
-        "cropName": "টমেটো",
-        "diseaseLabel": "টমেটোর নাবি ধসা রোগ",
-        "bnName": "নাবি ধসা",
-        "symptoms": [
-            "পাতায় বড় বাদামি দাগ, কিনারা পানিতে ভেজা",
-            "ফলে বাদামি শক্ত দাগ",
-            "সকালে পাতার নিচে সাদা আস্তরণ",
-        ],
-        "organic": [
-            "আক্রান্ত পাতা ও ফল সরিয়ে ফেলুন",
-            "জমিতে বাতাস চলাচল বাড়ান",
-        ],
-        "chemical": [
-            {
-                "product": "Metalaxyl + Mancozeb",
-                "bnName": "মেটালাক্সিল ও ম্যানকোজেব",
-                "dose": "প্রতি লিটারে ২ গ্রাম",
-                "note": "৭ দিন পরপর",
-            },
-        ],
-        "prevention": [
-            "বীজ শোধন করে বপন করুন",
-            "জমিতে পানি জমতে দেবেন না",
-        ],
-        "source": "BARI - টমেটোর রোগ ব্যবস্থাপনা",
-    },
-    # ----------------------------------------------------------------- chili --
-    {
-        "id": "chili_leaf_curl",
-        "cropId": "chili",
-        "cropName": "মরিচ",
-        "diseaseLabel": "মরিচের পাতা কোঁকড়ানো রোগ",
-        "bnName": "পাতা কোঁকড়ানো",
-        "symptoms": [
-            "নতুন পাতা কুঁকড়ে যায় ও ছোট হয়ে যায়",
-            "গাছের বৃদ্ধি থেমে যায়",
-            "ফল কম ধরে ও ফলের আকার ছোট হয়",
-        ],
-        "organic": [
-            "আক্রান্ত গাছ তুলে ফেলুন",
-            "সাদা মাছি নিয়ন্ত্রণে হলুদ আঠালো ফাঁদ ব্যবহার করুন",
-            "আগাছা পরিষ্কার রাখুন",
-        ],
-        "chemical": [
-            {
-                "product": "Imidacloprid",
-                "bnName": "ইমিডাক্লোপ্রিড",
-                "dose": "প্রতি লিটারে ০.৩ মিলি",
-                "note": "সাদা মাছি দমনে ৭ দিন পরপর",
-            },
-        ],
-        "prevention": [
-            "রোগমুক্ত চারা রোপণ করুন",
-            "পাশে অন্য ফসল চাষ করুন",
-            "সাদা মাছি দেখা দিলে সঙ্গে সঙ্গে ব্যবস্থা নিন",
-        ],
-        "source": "BARI - মরিচের রোগ ও পোকা ব্যবস্থাপনা",
-    },
-    {
-        "id": "chili_anthracnose",
-        "cropId": "chili",
-        "cropName": "মরিচ",
-        "diseaseLabel": "মরিচের অ্যানথ্রাকনোজ রোগ",
-        "bnName": "অ্যানথ্রাকনোজ",
-        "symptoms": [
-            "ফলে গোল বাদামি দাগ, মাঝখানে গাঢ় রিং",
-            "দাগ বড় হয়ে ফল পচে যায়",
-            "আক্রান্ত ফল গাছে ঝুলে থাকে",
-        ],
-        "organic": [
-            "আক্রান্ত ফল তুলে ফেলুন",
-            "ফসল আবর্তন করুন",
-        ],
-        "chemical": [
-            {
-                "product": "Carbendazim",
-                "bnName": "কার্বেন্ডাজিম",
-                "dose": "প্রতি লিটারে ১ গ্রাম",
-                "note": "১০ দিন পরপর",
-            },
-        ],
-        "prevention": [
-            "রোগমুক্ত বীজ ব্যবহার করুন",
-            "ফল সংগ্রহের পর জমি পরিষ্কার করুন",
-        ],
-        "source": "BARI - মরিচের রোগ ও পোকা ব্যবস্থাপনা",
-    },
 ]
 
+
+#: The checkpoint's `*_healthy` classes. They are a real result — the model
+#: looked and saw no disease — so they get their own entries. They are kept out
+#: of `KB` on purpose: `crops()` lists diseases, and a healthy plant is not one.
+HEALTHY: dict[str, DiseaseEntry] = {
+    "rice": {
+        "id": "rice_healthy",
+        "cropId": "rice",
+        "cropName": "ধান",
+        "diseaseLabel": "সুস্থ ধানের গাছ",
+        "bnName": "সুস্থ",
+        "symptoms": [],
+        "organic": [
+            "নিয়মিত পরিচর্যা চালিয়ে যান",
+            "সুষম সার ও সঠিক পানি ব্যবস্থাপনা বজায় রাখুন",
+        ],
+        # No chemical for a healthy plant: naming one would invite a spray
+        # nobody needs, which costs money and puts the farmer at risk.
+        "chemical": [],
+        "prevention": [
+            "নিয়মিত মাঠ পরিদর্শন করুন",
+            "রোগের প্রাথমিক লক্ষণ দেখা দিলে সঙ্গে সঙ্গে ব্যবস্থা নিন",
+        ],
+        "source": "BRRI - আধুনিক ধানের চাষ",
+    },
+    "potato": {
+        "id": "potato_healthy",
+        "cropId": "potato",
+        "cropName": "আলু",
+        "diseaseLabel": "সুস্থ আলুর গাছ",
+        "bnName": "সুস্থ",
+        "symptoms": [],
+        "organic": [
+            "নিয়মিত পরিচর্যা চালিয়ে যান",
+            "সুষম সার ও সঠিক পানি ব্যবস্থাপনা বজায় রাখুন",
+        ],
+        "chemical": [],
+        "prevention": [
+            "নিয়মিত মাঠ পরিদর্শন করুন",
+            "রোগের প্রাথমিক লক্ষণ দেখা দিলে সঙ্গে সঙ্গে ব্যবস্থা নিন",
+        ],
+        "source": "BARI - আলুর রোগ ব্যবস্থাপনা",
+    },
+}
+
 _DISEASES = {entry["id"]: entry for entry in KB}
+_HEALTHY_BY_ID = {entry["id"]: entry for entry in HEALTHY.values()}
 
 
 def get_disease(disease_id: str) -> DiseaseEntry | None:
-    return _DISEASES.get(disease_id)
+    """Look up an entry. Healthy verdicts are addressable here too."""
+    return _DISEASES.get(disease_id) or _HEALTHY_BY_ID.get(disease_id)
+
+
+def get_healthy(crop_id: str) -> DiseaseEntry | None:
+    return HEALTHY.get(crop_id)
 
 
 def diseases_for_crop(crop_id: str) -> list[DiseaseEntry]:

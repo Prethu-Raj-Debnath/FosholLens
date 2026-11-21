@@ -78,21 +78,29 @@ def test_winning_label_from_another_crop_is_undetermined() -> None:
     assert facts["confidence"] == pytest.approx(0.9)
 
 
-@pytest.mark.parametrize("label", ["Invalid", "Rice___Healthy", "Potato___Healthy"])
-def test_vit_non_diagnostic_labels_are_never_a_disease(label: str) -> None:
-    facts = _decide(_probs(VIT, **{label: 0.99}), "rice", VIT)
+def test_vit_invalid_label_is_never_a_disease() -> None:
+    facts = _decide(_probs(VIT, Invalid=0.99), "rice", VIT)
     assert facts["status"] == "undetermined"
     assert facts["disease_id"] is None
 
 
-def test_vit_known_label_without_a_kb_entry_is_not_invented() -> None:
-    """The model can name brown spot; the knowledge base has no entry for it.
+def test_vit_healthy_labels_resolve_to_a_healthy_answer() -> None:
+    """The deprecated ViT still carries healthy classes; they are a real answer."""
+    facts = _decide(_probs(VIT, Rice___Healthy=0.9), "rice", VIT)
+    assert facts["status"] == "identified"
+    assert facts["is_healthy"] is True
+    assert facts["disease_id"] == "rice_healthy"
+
+
+def test_vit_corn_and_wheat_have_no_kb_entry() -> None:
+    """The deprecated ViT can name crops this app does not support.
 
     Emitting a treatment anyway would mean writing a dose we have no source for.
     """
-    assert "Rice___Brown_Spot" not in VIT["label_disease"]
-    facts = _decide(_probs(VIT, Rice___Brown_Spot=0.9), "rice", VIT)
-    assert facts["status"] == "undetermined"
+    for label in ("Corn___Common_Rust", "Wheat___Brown_Rust"):
+        assert label not in VIT["label_disease"]
+        facts = _decide(_probs(VIT, **{label: 0.9}), "rice", VIT)
+        assert facts["status"] == "undetermined"
 
 
 # -------------------------------------------------------- efficientnet -----
@@ -117,9 +125,44 @@ def test_efficientnet_rice_other_is_not_a_disease() -> None:
     assert facts["status"] == "undetermined"
 
 
-def test_efficientnet_tungro_has_no_kb_entry() -> None:
+def test_efficientnet_tungro_resolves_to_its_kb_entry() -> None:
+    """Tungro used to be unmapped; it now has curated advice."""
     facts = _decide(_probs(EFFICIENTNET, rice_tungro=0.9), "rice", EFFICIENTNET)
-    assert facts["status"] == "undetermined"
+    assert facts["status"] == "identified"
+    assert facts["disease_id"] == "rice_tungro"
+    assert facts["is_healthy"] is False
+
+
+def test_efficientnet_brown_spot_resolves_to_its_kb_entry() -> None:
+    """The regression that started this: brown spot was recognised and dropped."""
+    facts = _decide(_probs(EFFICIENTNET, rice_brown_spot=0.96), "rice", EFFICIENTNET)
+    assert facts["status"] == "identified"
+    assert facts["disease_id"] == "rice_brown_spot"
+    assert facts["confidence"] == pytest.approx(0.96)
+
+
+@pytest.mark.parametrize(
+    ("label", "crop", "disease_id"),
+    [
+        ("rice_blast", "rice", "rice_blast"),
+        ("rice_bacterial_leaf_blight", "rice", "rice_bacterial_blight"),
+        ("rice_brown_spot", "rice", "rice_brown_spot"),
+        ("rice_tungro", "rice", "rice_tungro"),
+        ("potato_early_blight", "potato", "potato_early_blight"),
+        ("potato_late_blight", "potato", "potato_late_blight"),
+    ],
+)
+def test_every_efficientnet_disease_label_is_surfaced(
+    label: str, crop: str, disease_id: str
+) -> None:
+    """Every disease class the shipped model can emit must reach the farmer.
+
+    This is the point of the change: the model naming a disease the app has
+    advice for must never be swallowed into a generic "could not identify".
+    """
+    facts = _decide(_probs(EFFICIENTNET, **{label: 0.9}), crop, EFFICIENTNET)
+    assert facts["status"] == "identified"
+    assert facts["disease_id"] == disease_id
 
 
 def test_efficientnet_respects_the_requested_crop() -> None:
@@ -132,15 +175,33 @@ def test_efficientnet_respects_the_requested_crop() -> None:
     assert facts["status"] == "undetermined"
 
 
-@pytest.mark.parametrize("label", ["rice_healthy", "potato_healthy"])
-def test_efficientnet_healthy_is_not_dressed_up_as_disease(label: str) -> None:
-    crop = "potato" if label.startswith("potato") else "rice"
+@pytest.mark.parametrize(
+    ("label", "crop", "disease_id"),
+    [("rice_healthy", "rice", "rice_healthy"), ("potato_healthy", "potato", "potato_healthy")],
+)
+def test_efficientnet_healthy_is_surfaced_as_a_healthy_answer(
+    label: str, crop: str, disease_id: str
+) -> None:
+    """Healthy is a real result, not a miss.
+
+    It resolves to the crop's healthy entry, which carries no chemical, so the
+    farmer is told the plant looks fine instead of being left with "could not
+    identify" or — worse — a spray.
+    """
     facts = _decide(_probs(EFFICIENTNET, **{label: 0.95}), crop, EFFICIENTNET)
-    assert facts["status"] == "undetermined"
+    assert facts["status"] == "identified"
+    assert facts["is_healthy"] is True
+    assert facts["disease_id"] == disease_id
+
+    from app.grounding import knowledge_base
+
+    entry = knowledge_base.get_disease(disease_id)
+    assert entry is not None
+    assert entry["chemical"] == []
 
 
-def test_crops_without_classes_in_either_model_are_undetermined() -> None:
-    """Tomato and chili are out of scope for both checkpoints."""
+def test_crops_outside_rice_and_potato_are_undetermined() -> None:
+    """Tomato and chili are out of scope: no checkpoint can name them."""
     for crop in ("tomato", "chili"):
         for spec in (VIT, EFFICIENTNET):
             label = spec["labels"][0]
@@ -241,3 +302,40 @@ def test_absolute_model_dir_is_left_alone(tmp_path: Path) -> None:
     env = tmp_path / ".env"
     env.write_text(f"VISION_MODEL_DIR={tmp_path / 'weights'}\n", encoding="utf-8")
     assert Settings(_env_file=env).vision_model_dir == (tmp_path / "weights").resolve()
+
+
+# ------------------------------------------------------------ coverage ------
+def test_every_efficientnet_label_is_either_mapped_or_explicitly_non_diagnostic() -> None:
+    """No label may silently fall through unmapped.
+
+    This is the guard for the brown-spot bug: a class the model is confident
+    about but the app has no treatment for is a dead end for the farmer. Each
+    label must either reach a KB entry or be listed as deliberately
+    non-diagnostic, so adding a class to the checkpoint forces a decision here.
+    """
+    for label in EFFICIENTNET["labels"]:
+        mapped = label in EFFICIENTNET["label_disease"]
+        ignored = label in EFFICIENTNET["non_diagnostic"]
+        assert mapped != ignored, f"{label} must be exactly one of mapped/non-diagnostic"
+
+
+def test_efficientnet_has_no_missing_kb_entries() -> None:
+    from app.grounding import knowledge_base
+
+    for label, disease_id in EFFICIENTNET["label_disease"].items():
+        assert knowledge_base.get_disease(disease_id) is not None, (label, disease_id)
+
+
+def test_supported_crops_match_the_efficientnet_classes() -> None:
+    """The crops the app offers must be exactly the crops the model can name."""
+    from app.grounding import knowledge_base
+
+    model_crops = set(EFFICIENTNET["label_crop"].values())
+    assert model_crops == set(knowledge_base.SUPPORTED_CROPS) == {"rice", "potato"}
+
+
+def test_knowledge_base_has_no_entries_outside_supported_crops() -> None:
+    from app.grounding import knowledge_base
+
+    for entry in knowledge_base.KB:
+        assert entry["cropId"] in knowledge_base.SUPPORTED_CROPS, entry["id"]

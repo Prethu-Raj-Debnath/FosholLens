@@ -31,11 +31,10 @@ log = logging.getLogger(__name__)
 
 #: Which KB entry is used when the classifier cannot name the disease. Every
 #: crop still gets real, curated treatment; the result says it is unconfirmed.
+#: Rice and potato only: those are the two crops the shipped model can name.
 FALLBACK_DISEASE = {
     "rice": "rice_blast",
     "potato": "potato_late_blight",
-    "tomato": "tomato_early_blight",
-    "chili": "chili_leaf_curl",
 }
 
 #: Confidence band boundaries, applied to the classifier's probability.
@@ -145,6 +144,8 @@ async def _classify(analysis_id: str, crop_id: str) -> VisionFacts:
             confidence=None,
             crop_id=None,
             disease_id=None,
+            is_healthy=False,
+            model=None,
         )
     return await get_classifier().classify(image_path, crop_id)
 
@@ -152,16 +153,17 @@ async def _classify(analysis_id: str, crop_id: str) -> VisionFacts:
 def _resolve_disease(crop_id: str, vision: VisionFacts) -> knowledge_base.DiseaseEntry | None:
     """Pick the KB entry the advice will be built on.
 
-    A classifier match wins, but only if the entry it points at exists — the
-    mapping is kept narrow on purpose. Everything else falls back to one curated
-    entry per crop and is marked unconfirmed downstream, so the farmer still gets
-    correct treatment steps for their crop.
+    A classifier match wins — including a `healthy` match, which resolves to the
+    crop's healthy entry and carries no chemical. Everything else falls back to
+    one curated entry per crop and is marked unconfirmed downstream, so the
+    farmer still gets correct treatment steps for their crop.
     """
     if vision["status"] == "identified" and vision["disease_id"]:
         matched = knowledge_base.get_disease(vision["disease_id"])
         if matched is not None:
             return matched
-    return knowledge_base.get_disease(FALLBACK_DISEASE.get(crop_id, "rice_blast"))
+    fallback_id = FALLBACK_DISEASE.get(crop_id)
+    return knowledge_base.get_disease(fallback_id) if fallback_id else None
 
 
 def _confidence_band(confidence: float | None) -> str:
@@ -241,16 +243,21 @@ def _build_facts(
     saw a result for.
     """
     identified = vision["status"] == "identified"
+    healthy = bool(vision.get("is_healthy"))
     return {
         "diagnosis": {
             "crop": disease["cropName"],
             # The short name, so the narrative reads "ধানে ব্লাস্ট" rather than
             # "ধানে ধানের ব্লাস্ট". The full label is used in the result card.
-            "disease": f"{disease['bnName']} রোগ",
+            "disease": f"{disease['bnName']} রোগ" if not healthy else disease["bnName"],
             "confidence": _confidence_label(vision["confidence"]) if identified else None,
             "confirmed_by": "ছবি বিশ্লেষণ" if identified else None,
+            "healthy": healthy,
         },
-        "symptoms_observed": disease["symptoms"] if identified else [],
+        # A healthy plant has no symptoms to describe; the entry's symptom list
+        # is empty anyway, but being explicit stops a future edit from making
+        # "no disease" read like one.
+        "symptoms_observed": disease["symptoms"] if identified and not healthy else [],
         "treatment": {
             "organic": disease["organic"],
             "chemical": (
@@ -263,9 +270,11 @@ def _build_facts(
                     }
                     for chemical in disease["chemical"]
                 ]
-                if identified
+                if identified and not healthy
                 # No identified disease means no chemical reaches the model, so
-                # it cannot phrase a dose the evidence does not support.
+                # it cannot phrase a dose the evidence does not support. A
+                # healthy verdict is the strongest case of that: spraying a
+                # healthy crop wastes money and exposes the farmer to risk.
                 else []
             ),
         },
@@ -291,6 +300,7 @@ def _build_result(
     district_name: str | None = None,
 ) -> dict[str, Any]:
     identified = vision["status"] == "identified"
+    healthy = bool(vision.get("is_healthy"))
     return {
         "id": analysis_id,
         "createdAt": datetime.now(UTC).isoformat(),
@@ -307,12 +317,16 @@ def _build_result(
             "confidenceBand": _confidence_band(vision["confidence"]) if identified else "low",
             "isAiEstimate": True,
         },
-        "symptoms": disease["symptoms"] if identified else [],
+        "symptoms": disease["symptoms"] if identified and not healthy else [],
         "treatment": {
             "summary": (
-                "নিচের ধাপগুলো অনুসরণ করুন"
-                if identified
-                else f"{disease['cropName']} ফসলের জন্য সাধারণ পরিচর্যা"
+                f"{disease['cropName']} ফসলের জন্য সাধারণ পরিচর্যা"
+                if healthy
+                else (
+                    "নিচের ধাপগুলো অনুসরণ করুন"
+                    if identified
+                    else f"{disease['cropName']} ফসলের জন্য সাধারণ পরিচর্যা"
+                )
             ),
             "steps": (
                 [
@@ -320,7 +334,7 @@ def _build_result(
                     for chemical in disease["chemical"]
                 ]
                 + disease["organic"]
-                if identified
+                if identified and not healthy
                 # A dose is disease-specific. Listing one for a disease nobody
                 # confirmed would be a precise instruction with no evidence
                 # behind it, which is worse than no instruction at all.
@@ -334,10 +348,15 @@ def _build_result(
             "isUncertain": not identified,
             "message": (
                 "এটি একটি আনুমানিক ফলাফল। নিশ্চিত হওয়ার জন্য কৃষি কর্মকর্তার পরামর্শ নিন।"
-                if identified
-                else "ছবি থেকে রোগ নিশ্চিতভাবে শনাক্ত করা যায়নি। নিচের পরামর্শটি "
-                f"{disease['cropName']} ফসলের সাধারণ নির্দেশনা। সঠিক রোগ নিশ্চিত করতে "
-                "আরও পরিষ্কার ছবি দিন, অথবা উপজেলা কৃষি কর্মকর্তার পরামর্শ নিন।"
+                if identified and not healthy
+                else (
+                    "আপনার গাছটি সুস্থ দেখাচ্ছে। নিয়মিত পরিচর্যা চালিয়ে যান এবং "
+                    "রোগের লক্ষণ দেখা দিলে আবার ছবি দিন।"
+                    if healthy
+                    else "ছবি থেকে রোগ নিশ্চিতভাবে শনাক্ত করা যায়নি। নিচের পরামর্শটি "
+                    f"{disease['cropName']} ফসলের সাধারণ নির্দেশনা। সঠিক রোগ নিশ্চিত করতে "
+                    "আরও পরিষ্কার ছবি দিন, অথবা উপজেলা কৃষি কর্মকর্তার পরামর্শ নিন।"
+                )
             ),
         },
         "narrative": narrative,

@@ -14,8 +14,6 @@ const MAX_BYTES = 8 * 1024 * 1024;
 const CROPS = [
   { id: 'rice', name: 'ধান' },
   { id: 'potato', name: 'আলু' },
-  { id: 'tomato', name: 'টমেটো' },
-  { id: 'chili', name: 'মরিচ' },
 ] as const;
 
 /**

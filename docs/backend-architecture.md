@@ -278,10 +278,11 @@ with a phone, at an angle. Accuracy collapses. Mitigations, in order of value:
 4. Reject-then-ask: if the top-2 are within 0.05, treat as ambiguous.
 
 **Crop coverage is a scoping decision, not a bug.** PlantVillage gives rice,
-potato, tomato, chili, maize well. Brinjal, jute, sugarcane, mango, banana are
-thinner. Ship four crops done properly rather than ten done badly, and say so in
-the UI. Extend the enum in the generated contract types only when a model
-actually supports it.
+potato, tomato, chili, maize well, but the shipped EfficientNet checkpoint is
+trained on rice and potato only. The app therefore offers rice and potato and
+rejects anything else with `unsupported_crop`: a crop no model can name is a
+dead end for the farmer, not a feature. Extend the enum in the contract types
+only when a checkpoint actually supports it.
 
 **Do not send the image to the LLM in v1.** Perception belongs to the vision
 model; language belongs to the LLM. Giving both the image invites the LLM to
@@ -820,8 +821,9 @@ trustworthy — and it does, on the template path, with no key configured.
 1. `uv` venv on 3.12, `apps/api` scaffolded with FastAPI + `aiosqlite`.
 2. `POST /analyses` stores the image (EXIF stripped), returns 202;
    `pipeline.spawn()` advances `stage` in a detached task.
-3. Curated KB: 8 diseases across rice/potato/tomato/chili, each chemical with a
-   Bangla name, dose, note, and source.
+3. Curated KB: bread-and-butter diseases across rice/potato, each chemical with
+   a Bangla name, dose, note, and source. Scope is rice and potato only — the
+   two crops the shipped checkpoint can name. Tomato and chili were dropped.
 4. `GET /analyses/:id` polls; `GET /analyses/:id/result` serves the existing
    `AnalysisResult` shape; `/image` and `/audio` are separate subresources.
 5. Frontend switched from mock to HTTP with no layout change.

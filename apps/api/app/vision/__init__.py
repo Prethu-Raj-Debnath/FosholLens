@@ -4,10 +4,12 @@ Optional. Without a downloaded model, or when the classifier cannot place a
 photo, the pipeline falls back to an unconfirmed knowledge-base entry and says
 so — it never invents a confidence.
 
-Two checkpoints are available, selected by `VISION_MODEL`:
+`efficientnet` is the model this app ships and is built around: rice and potato,
+9 classes, and a curated entry for every one of them except its own
+`rice_other` catch-all.
 
-* ``vit``          - broad but mostly corn/wheat, downloaded on first use.
-* ``efficientnet`` - rice/potato only, local file, faster, one more disease.
+`vit` is deprecated and opt-in (`VISION_MODEL=vit`). It is kept only for
+comparison; its corn and wheat classes have no sourced treatment here.
 """
 
 from .classifier import (

@@ -367,6 +367,7 @@ class TemplateWriter:
         treatment = facts["treatment"]
         weather = facts.get("weather")
         uncertain: bool = facts.get("uncertain", False)
+        healthy: bool = diagnosis.get("healthy", False)
 
         parts: list[str] = []
 
@@ -375,6 +376,17 @@ class TemplateWriter:
                 f"আপনার {diagnosis['crop']} গাছের ছবি ভালোভাবে শনাক্ত করা যায়নি।"
                 " অনুগ্রহ করে আরও পরিষ্কার ছবি দিন, অথবা উপজেলা কৃষি কর্মকর্তাকে দেখান।"
             )
+        elif healthy:
+            # "ধরনে সুস্থ" rather than "রোগ হয়েছে" — the model found nothing
+            # wrong, and telling a farmer their plant is diseased when it is not
+            # invites a spray that costs money and does them no good.
+            parts.append(
+                f"আপনার {diagnosis['crop']} গাছটি সুস্থ দেখাচ্ছে, "
+                "কোনো রোগের স্পষ্ট লক্ষণ পাওয়া যায়নি।"
+            )
+            if treatment.get("organic"):
+                parts.append(treatment["organic"][0] + "।")
+            parts.append("নিয়মিত গাছ পরিদর্শন করুন এবং রোগের লক্ষণ দেখলে আবার ছবি দিন।")
         else:
             parts.append(f"আপনার {diagnosis['crop']} গাছে সম্ভবত {diagnosis['disease']} হয়েছে।")
 

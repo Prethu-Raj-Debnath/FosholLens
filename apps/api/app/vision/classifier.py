@@ -40,6 +40,10 @@ class VisionFacts(TypedDict):
     confidence: float | None
     crop_id: str | None
     disease_id: str | None
+    #: True when the winning class is one of the checkpoint's `*_healthy`
+    #: classes. That is a real answer ("the plant looks healthy"), not a miss,
+    #: and it must not be dressed up as a disease downstream.
+    is_healthy: bool
     #: Which checkpoint produced this, so a stored result stays interpretable
     #: after `VISION_MODEL` changes.
     model: str | None
@@ -232,7 +236,7 @@ def _decide(probabilities: Any, crop_id: str, spec: ModelSpec) -> VisionFacts:
     if confidence < settings.vision_confidence_threshold:
         return _undetermined(label, confidence, spec)
 
-    if label in spec["non_diagnostic"] or label in spec["healthy"]:
+    if label in spec["non_diagnostic"]:
         return _undetermined(label, confidence, spec)
 
     label_crop = spec["label_crop"].get(label)
@@ -243,6 +247,9 @@ def _decide(probabilities: Any, crop_id: str, spec: ModelSpec) -> VisionFacts:
 
     disease_id = spec["label_disease"].get(label)
     if disease_id is None:
+        # A label the checkpoint can name but the knowledge base has no sourced
+        # advice for (corn and wheat, on the deprecated ViT). Reporting it would
+        # mean inventing treatment, so it stays a miss.
         return _undetermined(label, confidence, spec)
 
     return VisionFacts(
@@ -251,6 +258,7 @@ def _decide(probabilities: Any, crop_id: str, spec: ModelSpec) -> VisionFacts:
         confidence=confidence,
         crop_id=label_crop,
         disease_id=disease_id,
+        is_healthy=label in spec["healthy"],
         model=spec["id"],
     )
 
@@ -262,6 +270,7 @@ def _undetermined(label: str | None, confidence: float | None, spec: ModelSpec) 
         confidence=confidence,
         crop_id=None,
         disease_id=None,
+        is_healthy=False,
         model=spec["id"],
     )
 
@@ -273,6 +282,7 @@ def _unavailable(spec: ModelSpec | None = None) -> VisionFacts:
         confidence=None,
         crop_id=None,
         disease_id=None,
+        is_healthy=False,
         model=spec["id"] if spec else None,
     )
 
