@@ -43,9 +43,9 @@ Smallholder rice (*ধান*) and potato (*আলু*) farmers in Bangladesh fa
 
 - **Frontend:** React, Vite, Tailwind CSS, `vite-plugin-pwa`, Noto Sans Bengali
 - **Backend:** Python 3.11+, FastAPI, Uvicorn, Pydantic, HTTPX
-- **Vision Models:** Hugging Face / ONNX plant-disease classification models (Rice & Potato)
-- **LLM & Multimodal Understanding:** Google Gemini Flash
-- **Text-to-Speech:** Bangla TTS (Gemini TTS / `edge-tts`)
+- **Vision Models:** Hugging Face Vision Transformer [`wambugu71/crop_leaf_diseases_vit`](https://huggingface.co/wambugu71/crop_leaf_diseases_vit) via `transformers` & PyTorch (Rice & Potato leaf classification)
+- **LLM & Multimodal Understanding:** Google Gemini Flash (`google-genai` SDK, `gemini-3.8-flash`, configurable via `GEMINI_MODEL`)
+- **Text-to-Speech:** Bangla TTS via `edge-tts` (`bn-BD-NabanitaNeural`) with browser Web Speech (`bn-BD`) fallback
 - **Weather API:** Open-Meteo Forecast API
 - **Datasets & Agricultural Knowledge Sources:**
   - PlantVillage Dataset (Potato leaf diseases)
@@ -66,6 +66,8 @@ In accordance with hackathon transparency rules, Team Tesseract discloses the us
 
 ## Third-Party Code & Assets Credits
 
+- [wambugu71/crop_leaf_diseases_vit](https://huggingface.co/wambugu71/crop_leaf_diseases_vit) — Pretrained Hugging Face Vision Transformer for crop leaf disease classification
+- [edge-tts](https://github.com/rany2/edge-tts) (`bn-BD-NabanitaNeural`) — Bangla neural text-to-speech synthesis
 - [FastAPI](https://fastapi.tiangolo.com/) & [Pydantic](https://docs.pydantic.dev/) — MIT License
 - [React](https://react.dev/), [Vite](https://vite.dev/), [Tailwind CSS](https://tailwindcss.com/), and [vite-plugin-pwa](https://vite-pwa-org.netlify.app/) — MIT License
 - [Noto Sans Bengali](https://fonts.google.com/noto/specimen/Noto+Sans+Bengali) — SIL Open Font License (OFL)
@@ -128,7 +130,7 @@ curl http://localhost:8000/api/health
 # {"status":"ok","service":"foshollens-api"}
 ```
 
-> **Note:** Until the AI/weather/RAG/TTS modules are plugged in, `POST /api/analyze` intentionally returns **HTTP 501 (Not Implemented)** rather than fabricated diagnoses.
+> **Note (Day 1 Vertical Slice):** `POST /api/analyze` runs the real ViT leaf classifier (`wambugu71/crop_leaf_diseases_vit`), Gemini Flash Bangla advisory, and `edge-tts` Bangla audio. The 48h Open-Meteo spray guard and BARI/BRRI RAG context will be connected in Day 2.
 
 ### 3. Frontend Setup (React + Vite PWA)
 
