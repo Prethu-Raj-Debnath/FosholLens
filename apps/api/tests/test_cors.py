@@ -1,0 +1,55 @@
+"""CORS behaviour.
+
+A dev server that drifts off port 5173 must still be able to talk to the API:
+Vite silently picks the next free port, and a rejected preflight surfaces as a
+generic upload failure rather than as a CORS problem.
+"""
+
+from __future__ import annotations
+
+import pytest
+from fastapi.testclient import TestClient
+
+from app.config import settings
+from app.main import create_app
+
+
+@pytest.fixture()
+def client(tmp_path, monkeypatch):
+    storage = tmp_path / "storage"
+    monkeypatch.setattr(settings, "database_path", storage / "test.db")
+    monkeypatch.setattr(settings, "storage_dir", storage)
+    for directory in (settings.images_dir, settings.audio_dir):
+        directory.mkdir(parents=True, exist_ok=True)
+    with TestClient(create_app()) as test_client:
+        yield test_client
+
+
+def _preflight(client: TestClient, origin: str):
+    return client.options(
+        "/api/v1/analyses",
+        headers={"Origin": origin, "Access-Control-Request-Method": "POST"},
+    )
+
+
+@pytest.mark.parametrize("port", [5173, 5174, 5175, 3000])
+def test_localhost_ports_are_allowed_in_development(client: TestClient, port: int) -> None:
+    origin = f"http://localhost:{port}"
+    response = _preflight(client, origin)
+    assert response.status_code == 200
+    assert response.headers["access-control-allow-origin"] == origin
+
+
+def test_127_0_0_1_is_allowed(client: TestClient) -> None:
+    origin = "http://127.0.0.1:5173"
+    response = _preflight(client, origin)
+    assert response.status_code == 200
+    assert response.headers["access-control-allow-origin"] == origin
+
+
+@pytest.mark.parametrize(
+    "origin", ["http://evil.com", "http://localhost.evil.com", "https://localhost"]
+)
+def test_other_origins_are_refused(client: TestClient, origin: str) -> None:
+    response = _preflight(client, origin)
+    assert "access-control-allow-origin" not in response.headers
