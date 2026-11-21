@@ -1,0 +1,293 @@
+"""Leaf disease classification.
+
+Two interchangeable checkpoints, chosen with `VISION_MODEL`:
+
+* `vit`          - ViT-tiny, 13 classes, corn/potato/rice/wheat, fetched from
+                   Hugging Face on first use (22 MB).
+* `efficientnet` - EfficientNet-B0, 9 classes, rice/potato only, loaded from
+                   `VISION_MODEL_DIR` (16 MB, no download).
+
+Both run through `onnxruntime`, which is already a dependency here (it powers
+the TTS engine), so neither adds install weight. The PyTorch path the upstream
+checkpoints ship was not used: it costs a ~900 MB `torch` wheel for a 22 MB
+model.
+
+The decision rule below is shared. Only the spec differs, so the two models
+cannot drift apart in *when they refuse* — just in what they can name.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+from pathlib import Path
+from typing import Any, Literal, TypedDict
+
+from ..config import settings
+from .models import ModelSpec, get_spec
+
+log = logging.getLogger(__name__)
+
+VisionStatus = Literal["identified", "undetermined", "unavailable"]
+
+
+class VisionFacts(TypedDict):
+    """What the classifier saw. Never asserts a disease on its own."""
+
+    status: VisionStatus
+    label: str | None
+    #: Softmax probability of the winning class, over the model's full label set.
+    confidence: float | None
+    crop_id: str | None
+    disease_id: str | None
+    #: Which checkpoint produced this, so a stored result stays interpretable
+    #: after `VISION_MODEL` changes.
+    model: str | None
+
+
+class LeafClassifier:
+    """Lazy, serialised ONNX inference for one checkpoint.
+
+    `onnxruntime` sessions are thread-safe for `run`, but construction is not,
+    so loading takes a lock — the same pattern the TTS engine uses for its
+    weights.
+    """
+
+    def __init__(self, spec: ModelSpec | None = None) -> None:
+        self._spec = spec if spec is not None else get_spec(settings.vision_model)
+        self._session: Any = None
+        self._load_lock = asyncio.Lock()
+
+    @property
+    def spec(self) -> ModelSpec:
+        return self._spec
+
+    @property
+    def available(self) -> bool:
+        return settings.vision_enabled
+
+    @property
+    def status(self) -> Literal["ready", "unavailable"]:
+        """Whether this stage can actually do anything right now.
+
+        Deliberately not a probe of the Hub: a checkpoint with a `hf_repo` is
+        downloaded on first use, so asking `/health` must not reach the network.
+        A *local* spec is different — its bytes either exist or they never will,
+        and reporting `ready` for a file that is not there turns every photo
+        into a silent "could not identify" instead of a startup error.
+        """
+        if not settings.vision_enabled:
+            return "unavailable"
+        if self._session is not None:
+            return "ready"
+        return "unavailable" if missing_weights(self._spec) else "ready"
+
+    def _load(self) -> Any:
+        """Open the ONNX graph, downloading the weights if the spec says so."""
+        import onnxruntime as ort
+
+        path = _resolve_weights(self._spec)
+        session = ort.InferenceSession(
+            str(path),
+            providers=["CPUExecutionProvider"],
+            sess_options=_session_options(ort),
+        )
+        log.info(
+            "vision model loaded: %s (%d classes)", self._spec["id"], len(self._spec["labels"])
+        )
+        return session
+
+    async def ensure_loaded(self) -> None:
+        if self._session is not None:
+            return
+        async with self._load_lock:
+            if self._session is None:
+                self._session = await asyncio.to_thread(self._load)
+
+    async def classify(self, image_path: Path, crop_id: str) -> VisionFacts:
+        """Classify one stored image for one crop.
+
+        Never raises: a missing model, unreadable image, or inference error all
+        return `unavailable`, because vision is the one stage that may degrade
+        without withholding the curated advice behind it.
+        """
+        if not self.available:
+            return _unavailable(self._spec)
+
+        try:
+            await self.ensure_loaded()
+            return await asyncio.to_thread(self._classify_sync, image_path, crop_id)
+        except Exception as exc:  # noqa: BLE001 - vision must never fail the job
+            log.warning(
+                "vision failed for %s: %s: %s",
+                image_path.name,
+                exc.__class__.__name__,
+                str(exc) or "no detail",
+            )
+            return _unavailable(self._spec)
+
+    def _classify_sync(self, image_path: Path, crop_id: str) -> VisionFacts:
+        from PIL import Image
+
+        spec = self._spec
+        try:
+            with Image.open(image_path) as opened:
+                image = opened.convert("RGB").resize(
+                    (spec["input_size"], spec["input_size"]), Image.Resampling.BILINEAR
+                )
+        except Exception as exc:  # noqa: BLE001
+            log.warning("vision image unreadable: %s", exc.__class__.__name__)
+            return _unavailable(spec)
+
+        batch = _to_tensor(image, spec)
+        logits = self._session.run(None, {spec["input_name"]: batch})[0][0]
+        return _decide(_softmax(logits), crop_id, spec)
+
+
+def _resolve_weights(spec: ModelSpec) -> Path:
+    """Find the checkpoint's bytes.
+
+    A spec with a Hub repo is downloaded (and cached) on first use. A spec
+    without one is a team-trained artifact: it must already be on disk, so a
+    missing file raises here naming the path it looked in rather than failing
+    later inside onnxruntime.
+    """
+    if spec["hf_repo"]:
+        from huggingface_hub import hf_hub_download
+
+        return Path(hf_hub_download(spec["hf_repo"], filename=spec["file"]))
+
+    path = Path(settings.vision_model_dir) / spec["file"]
+    if not path.exists():
+        raise FileNotFoundError(
+            f"vision model not found at {path}; put {spec['file']} there, or set "
+            f"VISION_MODEL_DIR to the directory containing it"
+        )
+    return path
+
+
+def missing_weights(spec: ModelSpec) -> Path | None:
+    """The local path that is missing, or `None` when this stage can proceed.
+
+    A Hub checkpoint returns `None` unconditionally: whether it is cached is not
+    worth a network call in `/health`, so "not known to be missing" is reported
+    as ready. The first real inference is what fetches it. A local spec is
+    different — the bytes either exist or they never will.
+    """
+    if spec["hf_repo"]:
+        return None
+
+    path = Path(settings.vision_model_dir) / spec["file"]
+    return None if path.exists() else path
+
+
+def _session_options(ort: Any) -> Any:
+    options = ort.SessionOptions()
+    # One image at a time, two pipeline slots. Extra threads would contend with
+    # the TTS synth that shares this process.
+    options.intra_op_num_threads = 2
+    options.inter_op_num_threads = 1
+    return options
+
+
+def _to_tensor(image: Any, spec: ModelSpec) -> Any:
+    """HWC uint8 -> NCHW float32, rescaled then normalised per the checkpoint.
+
+    Getting mean/std or the input size wrong does not raise; it quietly degrades
+    accuracy. That is why they live in the spec next to the label list.
+    """
+    import numpy as np
+
+    size = spec["input_size"]
+    array = np.asarray(image, dtype=np.float32) / 255.0
+    mean = np.array(spec["mean"], dtype=np.float32)
+    std = np.array(spec["std"], dtype=np.float32)
+    array = (array - mean) / std
+    assert array.shape[:2] == (size, size)  # noqa: S101 - preprocessing contract
+    return np.ascontiguousarray(array.transpose(2, 0, 1)[None])
+
+
+def _softmax(logits: Any) -> Any:
+    import numpy as np
+
+    shifted = logits - logits.max()
+    exponents = np.exp(shifted)
+    return exponents / exponents.sum()
+
+
+def _decide(probabilities: Any, crop_id: str, spec: ModelSpec) -> VisionFacts:
+    """Turn probabilities into facts, applying the threshold to raw mass.
+
+    The threshold is deliberately compared against the *unfiltered* probability
+    of the winning class. Renormalising onto the requested crop's classes first
+    and then thresholding — the tempting shortcut — lets a corn leaf clear 0.55
+    as "rice blast" whenever the rice classes merely outscore the corn ones,
+    because the renormalisation throws away the evidence that the whole photo
+    was a different crop.
+    """
+    index = int(probabilities.argmax())
+    label = spec["labels"][index]
+    confidence = float(probabilities[index])
+
+    if confidence < settings.vision_confidence_threshold:
+        return _undetermined(label, confidence, spec)
+
+    if label in spec["non_diagnostic"] or label in spec["healthy"]:
+        return _undetermined(label, confidence, spec)
+
+    label_crop = spec["label_crop"].get(label)
+    if label_crop != crop_id:
+        # Wrong crop in frame, or a crop this checkpoint cannot name. Either way
+        # the answer says nothing about the leaf the farmer photographed.
+        return _undetermined(label, confidence, spec)
+
+    disease_id = spec["label_disease"].get(label)
+    if disease_id is None:
+        return _undetermined(label, confidence, spec)
+
+    return VisionFacts(
+        status="identified",
+        label=label,
+        confidence=confidence,
+        crop_id=label_crop,
+        disease_id=disease_id,
+        model=spec["id"],
+    )
+
+
+def _undetermined(label: str | None, confidence: float | None, spec: ModelSpec) -> VisionFacts:
+    return VisionFacts(
+        status="undetermined",
+        label=label,
+        confidence=confidence,
+        crop_id=None,
+        disease_id=None,
+        model=spec["id"],
+    )
+
+
+def _unavailable(spec: ModelSpec | None = None) -> VisionFacts:
+    return VisionFacts(
+        status="unavailable",
+        label=None,
+        confidence=None,
+        crop_id=None,
+        disease_id=None,
+        model=spec["id"] if spec else None,
+    )
+
+
+_engine: LeafClassifier | None = None
+
+
+def get_classifier() -> LeafClassifier:
+    global _engine
+    if _engine is None:
+        _engine = LeafClassifier()
+    return _engine
+
+
+def reset_classifier() -> None:
+    """Drop the cached model. Used by tests after changing settings."""
+    global _engine
+    _engine = None

@@ -1,0 +1,140 @@
+import type { AnalysisResult } from '@foshol-lens/contracts';
+import { ChevronLeft } from 'lucide-react';
+import { Link } from 'react-router-dom';
+import { mediaUrl } from '../lib/api-client';
+import { formatBengaliDate } from '../lib/format';
+import { AudioPlayer } from './AudioPlayer';
+import { WeatherCard } from './WeatherCard';
+
+export function AnalysisResultView({ result }: { result: AnalysisResult }) {
+  const { diagnosis, uncertainty, narrative } = result;
+  const imageSrc = mediaUrl(result.imageUrl);
+
+  return (
+    <div className="page">
+      <Link to="/history" className="back-link">
+        <ChevronLeft size={17} aria-hidden="true" />
+        ইতিহাসে ফিরে যান
+      </Link>
+
+      <h1 className="page-heading" style={{ marginTop: 12 }}>
+        বিশ্লেষণের ফলাফল
+      </h1>
+      <p className="page-subtitle">
+        {result.cropName} • {formatBengaliDate(result.createdAt)}
+      </p>
+
+      <div className="result">
+        {imageSrc && (
+          <div className="result__image">
+            <img src={imageSrc} alt="বিশ্লেষণ করা ফসলের ছবি" />
+          </div>
+        )}
+
+        <div className="result__body">
+          {uncertainty.isUncertain && (
+            <div className="notice">
+              <div>
+                <p className="notice__title">রোগ নিশ্চিতভাবে শনাক্ত করা যায়নি</p>
+                <p className="notice__text">
+                  {uncertainty.message ||
+                    'ছবিটি থেকে নিশ্চিতভাবে রোগ শনাক্ত করা যায়নি। অনুগ্রহ করে আরও পরিষ্কার ছবি দিন।'}
+                </p>
+                <Link to="/" className="button-secondary" style={{ marginTop: 14 }}>
+                  নতুন ছবি দিন
+                </Link>
+              </div>
+            </div>
+          )}
+
+          {narrative && (
+            <section className="card card--narrative">
+              <p className="card__eyebrow">আপনার জন্য পরামর্শ</p>
+              <p className="narrative">{narrative}</p>
+              {result.audio && <AudioPlayer audio={result.audio} analysisId={result.id} />}
+            </section>
+          )}
+
+          {diagnosis && !uncertainty.isUncertain && (
+            <section className="card">
+              <p className="card__eyebrow">সম্ভাব্য রোগ</p>
+              <h2 className="card__title">{diagnosis.diseaseLabel}</h2>
+              {diagnosis.confidence !== null && (
+                <p className="confidence__note">
+                  ছবি বিশ্লেষণে মিলেছে {Math.round(diagnosis.confidence * 100)}% নিশ্চয়তায়।
+                </p>
+              )}
+              <p className="confidence__note">এটি একটি AI-উৎপন্ন আনুমানিক ফলাফল।</p>
+            </section>
+          )}
+
+          {result.symptoms.length > 0 && (
+            <section className="card">
+              <h2 className="card__label">লক্ষণ</h2>
+              <ul className="list">
+                {result.symptoms.map((symptom) => (
+                  <li key={symptom}>{symptom}</li>
+                ))}
+              </ul>
+            </section>
+          )}
+
+          {result.treatment && (
+            <section className="card card--plain">
+              <h2 className="card__label">
+                {uncertainty.isUncertain ? 'সাধারণ পরামর্শ' : 'প্রস্তাবিত চিকিৎসা'}
+              </h2>
+              <p className="card__text">{result.treatment.summary}</p>
+              <ul className="list">
+                {result.treatment.steps.map((step) => (
+                  <li key={step}>{step}</li>
+                ))}
+              </ul>
+              {result.treatment.source && (
+                <p className="confidence__note">তথ্যসূত্র: {result.treatment.source}</p>
+              )}
+            </section>
+          )}
+
+          {result.weather ? (
+            <WeatherCard weather={result.weather} />
+          ) : (
+            // The district was chosen, so silence looks like a bug. Being
+            // explicit also avoids implying the weather was checked.
+            result.district && (
+              <section className="card card--plain">
+                <p className="card__eyebrow">{result.district} জেলার আবহাওয়া</p>
+                <p className="card__text">
+                  আবহাওয়ার তথ্য এখন পাওয়া যাচ্ছে না। স্প্রে করার আগে আকাশের দিকে তাকিয়ে
+                  দেখুন।
+                </p>
+              </section>
+            )
+          )}
+
+          {result.prevention.length > 0 && (
+            <section className="card">
+              <h2 className="card__label">প্রতিরোধ</h2>
+              <ul className="list">
+                {result.prevention.map((item) => (
+                  <li key={item}>{item}</li>
+                ))}
+              </ul>
+            </section>
+          )}
+
+          {result.needsProfessionalVerification && !uncertainty.isUncertain && (
+            <div className="notice">
+              <div>
+                <p className="notice__title">পেশাদার যাচাই প্রয়োজন</p>
+                <p className="notice__text">
+                  চূড়ান্ত সিদ্ধান্তের জন্য স্থানীয় কৃষি কর্মকর্তার পরামর্শ নিন।
+                </p>
+              </div>
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
