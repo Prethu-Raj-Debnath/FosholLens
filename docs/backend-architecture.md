@@ -172,10 +172,22 @@ which the knowledge base has nothing to say about, so that coverage is mostly
 inert; it is kept as an option because a wrong-crop refusal ("that looks like
 corn") is occasionally more useful than "I don't know".
 
-Neither checkpoint's bytes are committed: `apps/api/models/` is gitignored, and
-the `vit` weights are fetched on first use. A missing local file degrades the
-stage to `unavailable` with a message naming the path it looked in, rather than
-failing the whole job.
+The **default** checkpoint is committed (`apps/api/models/foshollens_leaf.onnx`,
+16 MB), so a fresh clone runs with vision and needs no extra setup. It is the one
+file exempted from the `apps/api/models/` ignore rule; scratch exports and other
+checkpoints still stay out of the repo. The `vit` weights are not committed — 22 MB
+for an optional path — and download on first use.
+
+Two deliberate consequences:
+
+* `/health`'s `vision` field asks the classifier, not the env flag. A local
+  checkpoint that is absent reports `unavailable`; before this it reported `ready`
+  and every upload then degraded to "could not identify" with nothing to explain
+  why.
+* Startup logs a warning naming the missing path when the configured checkpoint
+  is absent, so the problem is visible in the log rather than discovered one
+  failed upload at a time. A missing file still degrades the stage rather than
+  failing the job: the curated advice behind it is still true.
 
 **Why ONNX and not `transformers`:** the upstream PyTorch path costs a ~900 MB
 `torch` wheel for a 16–22 MB model. The ONNX exports produce the same logits
@@ -698,7 +710,7 @@ LLM_MAX_CONCURRENCY=3                 # provider caps at 3 without a plan
 # ---- vision ----
 VISION_ENABLED=true
 VISION_MODEL=efficientnet             # or: vit
-VISION_MODEL_DIR=./models             # local checkpoint lives here (gitignored)
+VISION_MODEL_DIR=./models             # default checkpoint is committed here
 VISION_CONFIDENCE_THRESHOLD=0.55      # raw softmax, before any crop filtering
 
 # ---- TTS ----

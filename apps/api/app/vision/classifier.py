@@ -66,6 +66,22 @@ class LeafClassifier:
     def available(self) -> bool:
         return settings.vision_enabled
 
+    @property
+    def status(self) -> Literal["ready", "unavailable"]:
+        """Whether this stage can actually do anything right now.
+
+        Deliberately not a probe of the Hub: a checkpoint with a `hf_repo` is
+        downloaded on first use, so asking `/health` must not reach the network.
+        A *local* spec is different — its bytes either exist or they never will,
+        and reporting `ready` for a file that is not there turns every photo
+        into a silent "could not identify" instead of a startup error.
+        """
+        if not settings.vision_enabled:
+            return "unavailable"
+        if self._session is not None:
+            return "ready"
+        return "unavailable" if missing_weights(self._spec) else "ready"
+
     def _load(self) -> Any:
         """Open the ONNX graph, downloading the weights if the spec says so."""
         import onnxruntime as ort
@@ -148,6 +164,21 @@ def _resolve_weights(spec: ModelSpec) -> Path:
             f"VISION_MODEL_DIR to the directory containing it"
         )
     return path
+
+
+def missing_weights(spec: ModelSpec) -> Path | None:
+    """The local path that is missing, or `None` when this stage can proceed.
+
+    A Hub checkpoint returns `None` unconditionally: whether it is cached is not
+    worth a network call in `/health`, so "not known to be missing" is reported
+    as ready. The first real inference is what fetches it. A local spec is
+    different — the bytes either exist or they never will.
+    """
+    if spec["hf_repo"]:
+        return None
+
+    path = Path(settings.vision_model_dir) / spec["file"]
+    return None if path.exists() else path
 
 
 def _session_options(ort: Any) -> Any:

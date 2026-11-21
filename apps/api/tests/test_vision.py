@@ -12,11 +12,13 @@ the wrong crop is thrown away by the renormalisation itself.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import numpy as np
 import pytest
 
 from app.config import settings
-from app.vision.classifier import _decide, _softmax
+from app.vision.classifier import LeafClassifier, _decide, _softmax, missing_weights
 from app.vision.models import EFFICIENTNET, SPECS, VIT, ModelSpec, get_spec
 
 
@@ -178,3 +180,37 @@ def test_both_specs_only_map_labels_onto_real_kb_entries() -> None:
 def test_unknown_model_id_is_rejected_clearly() -> None:
     with pytest.raises(ValueError, match="unknown vision model"):
         get_spec("resnet")
+
+
+# ------------------------------------------------------- health truthfulness
+def test_status_is_ready_only_when_the_local_checkpoint_exists(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The bug this guards: `VISION_ENABLED=true` used to mean `vision: ready`.
+
+    A fresh clone has the flag set and no weights, so `/health` claimed the
+    stage was fine while every upload silently returned `undetermined`.
+    """
+    monkeypatch.setattr(settings, "vision_enabled", True)
+
+    monkeypatch.setattr(settings, "vision_model_dir", tmp_path)
+    assert LeafClassifier(EFFICIENTNET).status == "unavailable"
+    assert missing_weights(EFFICIENTNET) == tmp_path / EFFICIENTNET["file"]
+
+    (tmp_path / EFFICIENTNET["file"]).write_bytes(b"not really a model")
+    assert LeafClassifier(EFFICIENTNET).status == "ready"
+    assert missing_weights(EFFICIENTNET) is None
+
+
+def test_status_is_unavailable_when_vision_is_disabled(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(settings, "vision_enabled", False)
+    monkeypatch.setattr(settings, "vision_model_dir", tmp_path)
+    (tmp_path / EFFICIENTNET["file"]).write_bytes(b"not really a model")
+    assert LeafClassifier(EFFICIENTNET).status == "unavailable"
+
+
+def test_hub_checkpoint_is_not_reported_missing_offline(monkeypatch) -> None:
+    """`/health` must not hit the network; a Hub spec is not probed."""
+    monkeypatch.setattr(settings, "vision_enabled", True)
+    assert missing_weights(VIT) is None
+    assert LeafClassifier(VIT).status == "ready"

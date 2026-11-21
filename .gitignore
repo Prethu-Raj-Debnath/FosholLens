@@ -54,3 +54,15 @@ __pycache__/
 # Hackathon submission form: contains teammates' personal contact details.
 # Kept locally; must not land in a public repo.
 docs/fosollesns.pdf
+
+# The default vision checkpoint (EfficientNet-B0, 16 MB) is committed so a fresh
+# clone runs with vision instead of silently reporting every photo as
+# unidentified. The directory itself has to be re-included as well: git does not
+# descend into an ignored directory, so a bare `!file` rule would not work.
+# Everything else in models/ — experimental exports, other checkpoints — stays out.
+!apps/api/models/
+!apps/api/models/foshollens_leaf.onnx
+
+# The zip the checkpoint was delivered in. Its .onnx is byte-identical to the
+# committed file, so keeping it would just duplicate 16 MB in the worktree.
+foshollens_model.zip

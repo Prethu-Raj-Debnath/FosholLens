@@ -27,6 +27,7 @@ from .grounding import knowledge_base
 from .grounding.districts import DISTRICTS, get_district
 from .jobs import pipeline
 from .tts.engine import get_engine
+from .vision.classifier import get_classifier
 
 router = APIRouter()
 
@@ -80,7 +81,10 @@ async def health() -> HealthResponse:
         status="ok" if settings.llm_configured else "degraded",
         llm="ready" if settings.llm_configured else "unconfigured",
         tts="ready" if engine.available else "unavailable",
-        vision="ready" if settings.vision_enabled else "unavailable",
+        # Asks the classifier, not the env flag: a local checkpoint that is not
+        # on disk reports "unavailable" instead of claiming to be ready and then
+        # failing every upload silently.
+        vision=get_classifier().status,
         weather="ready",
         db="ok",
         version=VERSION,

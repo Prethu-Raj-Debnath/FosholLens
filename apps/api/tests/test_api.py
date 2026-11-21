@@ -61,7 +61,9 @@ def test_health_reports_template_fallback(client: TestClient) -> None:
     body = client.get("/api/v1/health").json()
     assert body["llm"] == "unconfigured"
     assert body["tts"] in {"ready", "unavailable"}
-    assert body["vision"] in {"ready", "unavailable"}
+    # The fixture disables vision, so "unavailable" is the honest answer; a
+    # "ready" here would mean the field is reporting the env flag, not reality.
+    assert body["vision"] == "unavailable"
     assert body["db"] == "ok"
 
 

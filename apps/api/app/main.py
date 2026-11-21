@@ -12,6 +12,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from . import store
 from .config import settings
 from .routes import router
+from .vision.classifier import get_classifier, missing_weights
 
 logging.basicConfig(
     level=logging.INFO,
@@ -30,7 +31,34 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
         log.info("purged %d analyses older than %d days", purged, settings.analysis_retention_days)
     log.info("LLM: %s", "enabled" if settings.llm_configured else "template fallback")
     log.info("TTS: %s", "enabled" if settings.tts_enabled else "disabled")
+    _log_vision_status()
     yield
+
+
+def _log_vision_status() -> None:
+    """Say plainly at boot whether vision can run.
+
+    Without this, a missing checkpoint is invisible until a farmer uploads a
+    photo — and then it looks like the model failed rather than never ran.
+    """
+    if not settings.vision_enabled:
+        log.info("Vision: disabled")
+        return
+
+    classifier = get_classifier()
+    spec = classifier.spec
+    missing = missing_weights(spec)
+    if missing is None:
+        log.info("Vision: enabled (%s)", spec["id"])
+        return
+
+    log.warning(
+        "Vision: enabled (%s) but the checkpoint is missing at %s — every photo "
+        "will be reported as unidentified. Put %s there, or set VISION_MODEL_DIR.",
+        spec["id"],
+        missing,
+        spec["file"],
+    )
 
 
 def create_app() -> FastAPI:
