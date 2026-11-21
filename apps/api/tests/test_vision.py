@@ -214,3 +214,30 @@ def test_hub_checkpoint_is_not_reported_missing_offline(monkeypatch) -> None:
     monkeypatch.setattr(settings, "vision_enabled", True)
     assert missing_weights(VIT) is None
     assert LeafClassifier(VIT).status == "ready"
+
+
+def test_relative_model_dir_is_anchored_to_the_api_package(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`.env.example` documents `./models`; that must not be CWD-relative.
+
+    A literal reading resolves against wherever uvicorn was launched from, so
+    the same `.env` worked under `npm run dev:api` (which `cd`s into apps/api)
+    and silently found nothing from the repo root.
+    """
+    from app.config import API_ROOT, Settings
+
+    env = tmp_path / ".env"
+    env.write_text("VISION_MODEL_DIR=./models\n", encoding="utf-8")
+    parsed = Settings(_env_file=env)
+
+    assert parsed.vision_model_dir.is_absolute()
+    assert parsed.vision_model_dir == (API_ROOT / "models").resolve()
+
+
+def test_absolute_model_dir_is_left_alone(tmp_path: Path) -> None:
+    from app.config import Settings
+
+    env = tmp_path / ".env"
+    env.write_text(f"VISION_MODEL_DIR={tmp_path / 'weights'}\n", encoding="utf-8")
+    assert Settings(_env_file=env).vision_model_dir == (tmp_path / "weights").resolve()

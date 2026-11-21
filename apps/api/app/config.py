@@ -76,6 +76,20 @@ class Settings(BaseSettings):
     def _strip_trailing_slash(cls, value: str) -> str:
         return value.rstrip("/")
 
+    @field_validator("vision_model_dir", "storage_dir", "database_path")
+    @classmethod
+    def _anchor_relative_paths_to_api_root(cls, value: Path) -> Path:
+        """Resolve a relative configured path against `apps/api`, not the CWD.
+
+        `.env.example` documents `VISION_MODEL_DIR=./models`. Taken literally that
+        is CWD-relative, so `uvicorn app.main:app` from the repo root would look
+        for `<repo>/models` and find nothing — failing identically to a missing
+        file, which is exactly the silent degradation this project just removed.
+        Anchoring to `API_ROOT` makes the documented value correct regardless of
+        where the server is launched from.
+        """
+        return value if value.is_absolute() else (API_ROOT / value).resolve()
+
     @property
     def cors_origins(self) -> list[str]:
         return [origin.strip() for origin in self.cors_origin.split(",") if origin.strip()]
