@@ -5,7 +5,8 @@ import type {
   AnalysisSummary,
 } from '@foshol-lens/contracts';
 
-const BASE_URL = import.meta.env.VITE_API_BASE_URL ?? 'http://localhost:4000';
+const RAW_BASE_URL = (import.meta.env.VITE_API_BASE_URL ?? '').trim();
+const BASE_URL = (RAW_BASE_URL || 'http://localhost:4000').replace(/\/+$/, '');
 const API_PREFIX = '/api/v1';
 
 /** Poll interval while an analysis is running. */

@@ -9,7 +9,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Literal
 
-from pydantic import Field, field_validator
+from pydantic import AliasChoices, Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 APP_DIR = Path(__file__).resolve().parent
@@ -27,7 +27,10 @@ class Settings(BaseSettings):
     # ---- core ---------------------------------------------------------
     app_env: Literal["development", "test", "production"] = "development"
     port: int = 4000
-    cors_origin: str = "http://localhost:5173"
+    cors_origin: str = Field(
+        default="http://localhost:5173",
+        validation_alias=AliasChoices("CORS_ORIGINS", "CORS_ORIGIN", "cors_origin"),
+    )
 
     # ---- LLM (optional: without a key the template writer is used) ----
     llm_provider: Literal["auto", "gemini", "openai"] = "auto"
@@ -99,7 +102,11 @@ class Settings(BaseSettings):
 
     @property
     def cors_origins(self) -> list[str]:
-        return [origin.strip() for origin in self.cors_origin.split(",") if origin.strip()]
+        return [
+            origin.strip().rstrip("/")
+            for origin in self.cors_origin.split(",")
+            if origin.strip().rstrip("/")
+        ]
 
     @property
     def effective_gemini_api_key(self) -> str:

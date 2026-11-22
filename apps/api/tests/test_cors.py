@@ -53,3 +53,30 @@ def test_127_0_0_1_is_allowed(client: TestClient) -> None:
 def test_other_origins_are_refused(client: TestClient, origin: str) -> None:
     response = _preflight(client, origin)
     assert "access-control-allow-origin" not in response.headers
+
+
+def test_cors_origins_env_accepts_comma_separated_production_urls(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from app.config import Settings
+
+    monkeypatch.setenv("CORS_ORIGINS", "http://localhost:5173, https://foshollens.vercel.app/")
+    monkeypatch.setenv("APP_ENV", "production")
+    parsed = Settings(_env_file=None)
+    assert parsed.cors_origins == ["http://localhost:5173", "https://foshollens.vercel.app"]
+
+    storage = tmp_path / "storage"
+    monkeypatch.setattr(settings, "database_path", storage / "test.db")
+    monkeypatch.setattr(settings, "storage_dir", storage)
+    monkeypatch.setattr(settings, "app_env", "production")
+    monkeypatch.setattr(settings, "cors_origin", parsed.cors_origin)
+    for directory in (settings.images_dir, settings.audio_dir):
+        directory.mkdir(parents=True, exist_ok=True)
+
+    with TestClient(create_app()) as prod_client:
+        allowed = _preflight(prod_client, "https://foshollens.vercel.app")
+        assert allowed.status_code == 200
+        assert allowed.headers["access-control-allow-origin"] == "https://foshollens.vercel.app"
+
+        blocked = _preflight(prod_client, "http://localhost:5174")
+        assert "access-control-allow-origin" not in blocked.headers
