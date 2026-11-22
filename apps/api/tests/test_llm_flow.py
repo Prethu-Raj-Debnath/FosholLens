@@ -15,6 +15,7 @@ import pytest
 
 from app.llm import writer as writer_module
 from app.llm.writer import (
+    FallbackWriter,
     GeminiWriter,
     InvalidNarrative,
     LlmWriter,
@@ -232,6 +233,24 @@ def test_writer_selection_uses_openai_when_explicitly_selected(monkeypatch) -> N
         reset_writer()
 
 
+def test_writer_selection_builds_fallback_writer_when_both_keys_configured(monkeypatch) -> None:
+    monkeypatch.setattr(writer_module.settings, "llm_provider", "auto")
+    monkeypatch.setattr(writer_module.settings, "gemini_api_key", "test-gemini-not-real")
+    monkeypatch.setattr(writer_module.settings, "llm_api_key", "test-openai-not-real")
+    reset_writer()
+    try:
+        assert isinstance(get_writer(), FallbackWriter)
+    finally:
+        reset_writer()
+
+    monkeypatch.setattr(writer_module.settings, "llm_provider", "gemini")
+    reset_writer()
+    try:
+        assert isinstance(get_writer(), GeminiWriter)
+    finally:
+        reset_writer()
+
+
 class StubGeminiModels:
     """Records Gemini generate_content calls and replays queued responses."""
 
@@ -257,7 +276,8 @@ def _gemini_writer_with(responses) -> tuple[GeminiWriter, StubGeminiModels]:
     return writer, models
 
 
-async def test_gemini_good_output_is_accepted() -> None:
+async def test_gemini_good_output_is_accepted(monkeypatch) -> None:
+    monkeypatch.setattr(writer_module.settings, "gemini_model", writer_module.DEFAULT_GEMINI_MODEL)
     writer, models = _gemini_writer_with(
         [SimpleNamespace(text=json.dumps({"spoken": GOOD_SPOKEN}, ensure_ascii=False))]
     )
@@ -328,3 +348,117 @@ async def test_gemini_two_bad_answers_raise_for_fallback() -> None:
     )
     with pytest.raises(InvalidNarrative, match="unusable_after_retry"):
         await writer.write(FACTS)
+
+
+async def test_gemini_retry_reuses_working_fallback_and_forbids_chemicals(monkeypatch) -> None:
+    from google.genai import errors as genai_errors
+
+    monkeypatch.setattr(writer_module.settings, "gemini_model", "gemini-3.8-flash")
+    unconfirmed_facts = {
+        "diagnosis": {"crop": "আলু", "disease": "আলুর নাবি ধসা রোগ", "confidence": None},
+        "symptoms_observed": [],
+        "treatment": {"organic": ["আক্রান্ত গাছ সরিয়ে ফেলুন"], "chemical": []},
+        "prevention": ["সুষম সার ব্যবহার করুন"],
+        "weather": None,
+        "uncertain": True,
+    }
+    valid_unconfirmed_spoken = (
+        "আপনার আলু গাছের ছবি থেকে রোগ নিশ্চিতভাবে বোঝা যায়নি। "
+        "তাই আন্দাজে কোনো ছত্রাকনাশক বা ওষুধ স্প্রে করবেন না এবং স্থানীয় কৃষি কর্মকর্তার পরামর্শ নিন। "
+        "মনে রাখবেন, এটি একটি আনুমানিক পরামর্শ।"
+    )
+    writer, models = _gemini_writer_with(
+        [
+            genai_errors.APIError(503, {"error": {"message": "overloaded"}}),
+            genai_errors.APIError(503, {"error": {"message": "overloaded"}}),
+            genai_errors.APIError(503, {"error": {"message": "overloaded"}}),
+            SimpleNamespace(text=json.dumps({"spoken": "ধান"}, ensure_ascii=False)),
+            SimpleNamespace(
+                text=json.dumps({"spoken": valid_unconfirmed_spoken}, ensure_ascii=False)
+            ),
+        ]
+    )
+    text, generated_by = await writer.write(unconfirmed_facts)
+
+    assert generated_by == "llm"
+    assert "আন্দাজে" in text
+    assert [call["model"] for call in models.calls] == [
+        "gemini-3.8-flash",
+        "gemini-3.7-flash",
+        "gemini-3.5-flash",
+        "gemini-3.5-flash-lite",
+        "gemini-3.5-flash-lite",
+    ]
+    assert (
+        "কোনো ওষুধ, ছত্রাকনাশক বা রাসায়নিকের নাম উল্লেখ করবে না"
+        in models.calls[4]["contents"]
+    )
+    assert models.calls[0]["config"].automatic_function_calling.disable is True
+
+
+async def test_gemini_504_and_timeout_fallback_cools_down_failing_models(monkeypatch) -> None:
+    from google.genai import errors as genai_errors
+
+    monkeypatch.setattr(writer_module.settings, "gemini_model", "gemini-3.8-flash")
+    writer, models = _gemini_writer_with(
+        [
+            genai_errors.APIError(504, {"error": {"message": "deadline exceeded"}}),
+            genai_errors.APIError(500, {"error": {"message": "internal error"}}),
+            TimeoutError("client timeout"),
+            SimpleNamespace(text=json.dumps({"spoken": GOOD_SPOKEN}, ensure_ascii=False)),
+            SimpleNamespace(text=json.dumps({"spoken": GOOD_SPOKEN}, ensure_ascii=False)),
+        ]
+    )
+
+    text1, gen1 = await writer.write(FACTS)
+    assert gen1 == "llm"
+    assert "ট্রাইসাইক্লাজল" in text1
+
+    text2, gen2 = await writer.write(FACTS)
+    assert gen2 == "llm"
+    assert "ট্রাইসাইক্লাজল" in text2
+
+    assert [call["model"] for call in models.calls] == [
+        "gemini-3.8-flash",
+        "gemini-3.7-flash",
+        "gemini-3.5-flash",
+        "gemini-3.5-flash-lite",
+        "gemini-3.5-flash-lite",
+    ]
+
+
+async def test_fallback_writer_switches_to_secondary_on_failure_with_cooldown() -> None:
+    calls: list[str] = []
+
+    class StubPrimary:
+        async def write(self, _facts):
+            calls.append("primary")
+            raise TimeoutError("gemini down")
+
+    class StubSecondary:
+        async def write(self, _facts):
+            calls.append("secondary")
+            return GOOD_SPOKEN, "llm"
+
+    fallback = FallbackWriter([StubPrimary(), StubSecondary()], cooldown_seconds=60.0)
+    text1, gen1 = await fallback.write(FACTS)
+    assert (text1, gen1) == (GOOD_SPOKEN, "llm")
+
+    # Primary is now on cooldown, so secondary is called first on the next request.
+    text2, gen2 = await fallback.write(FACTS)
+    assert (text2, gen2) == (GOOD_SPOKEN, "llm")
+    assert calls == ["primary", "secondary", "secondary"]
+
+
+async def test_fallback_writer_propagates_error_when_all_providers_fail() -> None:
+    class StubPrimary:
+        async def write(self, _facts):
+            raise TimeoutError("gemini down")
+
+    class StubSecondary:
+        async def write(self, _facts):
+            raise RuntimeError("openai down")
+
+    fallback = FallbackWriter([StubPrimary(), StubSecondary()])
+    with pytest.raises(RuntimeError, match="openai down"):
+        await fallback.write(FACTS)

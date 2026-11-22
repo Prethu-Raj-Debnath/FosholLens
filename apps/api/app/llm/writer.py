@@ -17,9 +17,12 @@ import asyncio
 import json
 import logging
 import re
+import time
 import unicodedata
+from collections.abc import Callable
 from typing import Any, Protocol
 
+import httpx
 from pydantic import BaseModel
 
 from ..config import settings
@@ -139,6 +142,8 @@ SYSTEM_PROMPT = """\
 - কোনো মার্কডাউন, বুলেট, ইমোজি, লিংক বা তালিকা নয়। শুধু টানা বাক্য।
 - ওষুধ, সক্রিয় উপাদান ও মাত্রা কেবল নিচে দেওয়া অনুমোদিত তথ্য ও পুনরুদ্ধার করা অংশ থেকে নেবে।
   নিজের থেকে কোনো নতুন ওষুধ, মাত্রা বা রোগের নাম বানাবে না।
+- যদি অনুমোদিত ওষুধের তালিকা খালি থাকে বা রোগ নিশ্চিত না হয়, তবে কোনো ওষুধ বা ছত্রাকনাশকের নাম লিখবে না—
+  কৃষক ওষুধ জানতে চাইলেও না।
 - যদি 'কালচারাল ওনলি' বা ছত্রাকনাশক অকার্যকর বলে উল্লেখ থাকে (যেমন ব্যাকটেরিয়াল লিফ ব্লাইট বা টুংরো),
   তবে স্পষ্ট জানাবে যে ছত্রাকনাশক কাজ করবে না এবং শুধু পরিচর্যা ও বাহক নিয়ন্ত্রণের ধাপ বলবে।
 - যদি গাছ সুস্থ বলে উল্লেখ থাকে, তবে কোনো স্প্রে না করার কথা স্পষ্টভাবে বলবে।
@@ -160,8 +165,11 @@ FALLBACK_GEMINI_MODELS: tuple[str, ...] = (
     "gemini-3.7-flash",
     "gemini-3.5-flash",
     "gemini-3.5-flash-lite",
+    "gemini-3.1-flash-lite",
 )
-_RETRYABLE_GEMINI_CODES = frozenset({404, 429, 503})
+_RETRYABLE_GEMINI_CODES = frozenset({404, 429, 500, 502, 503, 504})
+_GEMINI_MODEL_COOLDOWN_SECONDS = 180.0
+_PROVIDER_COOLDOWN_SECONDS = 120.0
 
 
 class _SpokenAdvice(BaseModel):
@@ -199,6 +207,34 @@ def _allowed_chemicals(facts: dict[str, Any]) -> list[str]:
     return allowed
 
 
+def _build_user_prompt(facts: dict[str, Any], allowed: list[str], *, is_retry: bool) -> str:
+    payload = json.dumps(facts, ensure_ascii=False, indent=2)
+    if not is_retry:
+        return f"তথ্য:\n{payload}"
+    retry_note = (
+        "আগের উত্তরটি নিয়ম মানেনি। এবার কেবল বাংলা অক্ষরে, "
+        "২ থেকে ৪ বাক্যে, কোনো ইংরেজি অক্ষর ছাড়া লেখো।"
+    )
+    if not allowed:
+        retry_note += " কোনো ওষুধ, ছত্রাকনাশক বা রাসায়নিকের নাম উল্লেখ করবে না।"
+    return f"{retry_note}\n\nতথ্য:\n{payload}"
+
+
+def _parse_and_validate_spoken(raw_text: str, allowed: list[str]) -> str:
+    if not raw_text:
+        raise InvalidNarrative("empty")
+
+    try:
+        parsed = json.loads(raw_text)
+    except json.JSONDecodeError as exc:
+        raise InvalidNarrative("invalid_json") from exc
+
+    if not isinstance(parsed, dict) or not isinstance(parsed.get("spoken"), str):
+        raise InvalidNarrative("missing_spoken")
+
+    return validate_narrative(parsed["spoken"], allowed)
+
+
 class GeminiWriter:
     """Primary Bangla advisory writer backed by Google Gemini Flash."""
 
@@ -217,15 +253,25 @@ class GeminiWriter:
             http_options=types.HttpOptions(timeout=settings.llm_timeout_ms),
         )
         self._semaphore = asyncio.Semaphore(settings.llm_max_concurrency)
+        self._model_cooldowns: dict[str, float] = {}
 
     async def write(self, facts: dict[str, Any]) -> tuple[str, str]:
         allowed = _allowed_chemicals(facts)
         last_error: Exception | None = None
+        preferred_model: str | None = None
 
         for attempt in (1, 2):
             try:
-                text = await self._attempt(facts, allowed, is_retry=attempt == 2)
-                return text, "llm"
+                raw_text, used_model = await self._generate_raw(
+                    facts,
+                    allowed,
+                    is_retry=attempt == 2,
+                    preferred_model=preferred_model,
+                )
+                # Stick to whichever fallback model answered so a retry does not
+                # re-hit upstream 503s from earlier candidates.
+                preferred_model = used_model
+                return _parse_and_validate_spoken(raw_text, allowed), "llm"
             except InvalidNarrative as exc:
                 last_error = exc
                 log.warning("Gemini output rejected (attempt %d): %s", attempt, exc)
@@ -235,63 +281,90 @@ class GeminiWriter:
 
         raise InvalidNarrative(f"unusable_after_retry:{last_error}")
 
-    async def _attempt(self, facts: dict[str, Any], allowed: list[str], *, is_retry: bool) -> str:
+    async def _generate_raw(
+        self,
+        facts: dict[str, Any],
+        allowed: list[str],
+        *,
+        is_retry: bool,
+        preferred_model: str | None = None,
+    ) -> tuple[str, str]:
         from google.genai import types
 
-        payload = json.dumps(facts, ensure_ascii=False, indent=2)
-        if is_retry:
-            user_prompt = (
-                "আগের উত্তরটি নিয়ম মানেনি। এবার কেবল বাংলা অক্ষরে, "
-                "২ থেকে ৪ বাক্যে, কোনো ইংরেজি অক্ষর ছাড়া লেখো।\n\n"
-                f"তথ্য:\n{payload}"
-            )
-        else:
-            user_prompt = f"তথ্য:\n{payload}"
-
+        user_prompt = _build_user_prompt(facts, allowed, is_retry=is_retry)
         config = types.GenerateContentConfig(
             system_instruction=SYSTEM_PROMPT,
             response_mime_type="application/json",
             response_schema=_SpokenAdvice,
             temperature=0.35,
+            automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
         )
 
         async with self._semaphore:
-            response = await asyncio.to_thread(
-                self._generate_with_fallback, user_prompt, config
+            response, used_model = await asyncio.to_thread(
+                self._generate_with_fallback,
+                user_prompt,
+                config,
+                preferred_model=preferred_model,
             )
 
-        raw_text = (getattr(response, "text", None) or "").strip()
-        if not raw_text:
-            raise InvalidNarrative("empty")
+        return (getattr(response, "text", None) or "").strip(), used_model
 
-        try:
-            parsed = json.loads(raw_text)
-        except json.JSONDecodeError as exc:
-            raise InvalidNarrative("invalid_json") from exc
-
-        if not isinstance(parsed, dict) or not isinstance(parsed.get("spoken"), str):
-            raise InvalidNarrative("missing_spoken")
-
-        return validate_narrative(parsed["spoken"], allowed)
-
-    def _generate_with_fallback(self, user_prompt: str, config: Any) -> Any:
+    def _generate_with_fallback(
+        self,
+        user_prompt: str,
+        config: Any,
+        *,
+        preferred_model: str | None = None,
+    ) -> tuple[Any, str]:
         from google.genai import errors as genai_errors
 
+        # Lazily create in case a test instantiates via GeminiWriter.__new__.
+        cooldowns: dict[str, float] | None = getattr(self, "_model_cooldowns", None)
+        if cooldowns is None:
+            cooldowns = {}
+            self._model_cooldowns = cooldowns
+
+        candidates = _candidate_gemini_models()
+        if preferred_model and preferred_model in candidates:
+            candidates = [preferred_model, *[m for m in candidates if m != preferred_model]]
+
+        now = time.monotonic()
+        active = [m for m in candidates if cooldowns.get(m, 0.0) <= now]
+        cooled = [m for m in candidates if cooldowns.get(m, 0.0) > now]
+
         last_exc: Exception | None = None
-        for model_name in _candidate_gemini_models():
+        for model_name in [*active, *cooled]:
             try:
-                return self._client.models.generate_content(
+                response = self._client.models.generate_content(
                     model=model_name,
                     contents=user_prompt,
                     config=config,
                 )
+                cooldowns.pop(model_name, None)
+                return response, model_name
             except genai_errors.APIError as exc:
                 last_exc = exc
                 if exc.code in _RETRYABLE_GEMINI_CODES:
-                    logger_msg = "Gemini model %s returned HTTP %s; trying fallback model."
-                    log.warning(logger_msg, model_name, exc.code)
+                    cooldowns[model_name] = time.monotonic() + _GEMINI_MODEL_COOLDOWN_SECONDS
+                    log.warning(
+                        "Gemini model %s returned HTTP %s; cooling down %.0fs and trying fallback.",
+                        model_name,
+                        exc.code,
+                        _GEMINI_MODEL_COOLDOWN_SECONDS,
+                    )
                     continue
                 raise
+            except (TimeoutError, httpx.TimeoutException) as exc:
+                last_exc = exc
+                cooldowns[model_name] = time.monotonic() + _GEMINI_MODEL_COOLDOWN_SECONDS
+                log.warning(
+                    "Gemini model %s timed out (%s); cooling down %.0fs and trying fallback.",
+                    model_name,
+                    exc.__class__.__name__,
+                    _GEMINI_MODEL_COOLDOWN_SECONDS,
+                )
+                continue
 
         raise RuntimeError(f"All Gemini Flash models failed: {last_exc}") from last_exc
 
@@ -346,21 +419,8 @@ class LlmWriter:
     async def _attempt(self, facts: dict[str, Any], allowed: list[str], *, is_retry: bool) -> str:
         messages: list[dict[str, Any]] = [
             {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": _build_user_prompt(facts, allowed, is_retry=is_retry)},
         ]
-        payload = json.dumps(facts, ensure_ascii=False, indent=2)
-        if is_retry:
-            messages.append(
-                {
-                    "role": "user",
-                    "content": (
-                        "আগের উত্তরটি নিয়ম মানেনি। এবার কেবল বাংলা অক্ষরে, "
-                        "২ থেকে ৪ বাক্যে, কোনো ইংরেজি অক্ষর ছাড়া লেখো।\n\n"
-                        f"তথ্য:\n{payload}"
-                    ),
-                }
-            )
-        else:
-            messages.append({"role": "user", "content": f"তথ্য:\n{payload}"})
 
         async with self._semaphore:
             response = await self._client.chat.completions.create(
@@ -466,22 +526,95 @@ class TemplateWriter:
         return normalise(" ".join(parts))
 
 
+class FallbackWriter:
+    """Try configured LLM writers in priority order, cooling down failing providers."""
+
+    def __init__(
+        self,
+        writers: list[Writer],
+        *,
+        cooldown_seconds: float = _PROVIDER_COOLDOWN_SECONDS,
+    ) -> None:
+        if not writers:
+            raise ValueError("FallbackWriter requires at least one writer")
+        self._writers = writers
+        self._cooldown_seconds = cooldown_seconds
+        self._cooldown_until: dict[int, float] = {}
+
+    async def write(self, facts: dict[str, Any]) -> tuple[str, str]:
+        now = time.monotonic()
+        active = [
+            idx for idx in range(len(self._writers)) if self._cooldown_until.get(idx, 0.0) <= now
+        ]
+        cooled = [
+            idx for idx in range(len(self._writers)) if self._cooldown_until.get(idx, 0.0) > now
+        ]
+        order = [*active, *cooled]
+
+        failed_indices: list[int] = []
+        last_exc: Exception | None = None
+        for pos, idx in enumerate(order):
+            writer = self._writers[idx]
+            try:
+                result = await writer.write(facts)
+                self._cooldown_until.pop(idx, None)
+                cooldown_deadline = time.monotonic() + self._cooldown_seconds
+                for failed_idx in failed_indices:
+                    self._cooldown_until[failed_idx] = cooldown_deadline
+                return result
+            except Exception as exc:  # noqa: BLE001 - fall through to secondary LLM writer
+                last_exc = exc
+                failed_indices.append(idx)
+                next_name = (
+                    self._writers[order[pos + 1]].__class__.__name__
+                    if pos + 1 < len(order)
+                    else "TemplateWriter"
+                )
+                log.warning(
+                    "Writer %s failed (%s); falling back to %s.",
+                    writer.__class__.__name__,
+                    exc.__class__.__name__,
+                    next_name,
+                )
+
+        if last_exc is not None:
+            raise last_exc
+        raise RuntimeError("No LLM writers available")
+
+
+def _try_build(factory: Callable[[], Writer], label: str) -> Writer | None:
+    try:
+        return factory()
+    except Exception as exc:  # noqa: BLE001 - any construction failure degrades
+        log.error("%s writer unavailable (%s); skipping", label, exc)
+        return None
+
+
 def build_writer() -> Writer:
     if not settings.llm_configured:
         return TemplateWriter()
 
     if settings.llm_provider == "openai":
-        try:
-            return LlmWriter()
-        except Exception as exc:  # noqa: BLE001 - any construction failure degrades
-            log.error("OpenAI-compatible writer unavailable (%s); falling back to template", exc)
-            return TemplateWriter()
+        return _try_build(LlmWriter, "OpenAI-compatible") or TemplateWriter()
 
-    try:
-        return GeminiWriter()
-    except Exception as exc:  # noqa: BLE001 - any construction failure degrades
-        log.error("Gemini writer unavailable (%s); falling back to template", exc)
+    has_gemini_key = bool(settings.gemini_api_key.strip())
+    has_openai_key = bool(settings.llm_api_key.strip())
+    if settings.llm_provider == "auto" and has_gemini_key and has_openai_key:
+        writers = [
+            writer
+            for writer in (
+                _try_build(GeminiWriter, "Gemini"),
+                _try_build(LlmWriter, "OpenAI-compatible"),
+            )
+            if writer is not None
+        ]
+        if len(writers) >= 2:
+            return FallbackWriter(writers)
+        if len(writers) == 1:
+            return writers[0]
         return TemplateWriter()
+
+    return _try_build(GeminiWriter, "Gemini") or TemplateWriter()
 
 
 _writer: Writer | None = None

@@ -381,9 +381,10 @@ def _build_facts(
         if grounding.sources
         else (is_healthy or not disease["chemical"])
     )
+    allow_chemicals = confirmed and not cultural_only and not is_healthy
     refer_to_officer = (not confirmed) or grounding.refer_to_officer
 
-    if not confirmed or cultural_only or is_healthy:
+    if not allow_chemicals:
         prompt_chemicals: list[dict[str, str]] = []
     elif grounding.chemicals:
         prompt_chemicals = [
@@ -406,18 +407,19 @@ def _build_facts(
             for chemical in disease["chemical"]
         ]
 
+    # Exclude chemical-bearing RAG prose whenever chemicals are disallowed so the
+    # writer never sees fungicide names (e.g. Mancozeb) that the validator blocks.
     passages = [
         {
             **passage,
-            "chemicals": (
-                passage["chemicals"] if (confirmed and not cultural_only and not is_healthy) else []
-            ),
+            "chemicals": passage["chemicals"] if allow_chemicals else [],
         }
         for passage in grounding.prompt_passages
+        if allow_chemicals or not passage.get("chemicals")
     ]
 
     weather_facts = weather.as_prompt_facts() if weather else None
-    if weather_facts is not None and (is_healthy or cultural_only or not confirmed):
+    if weather_facts is not None and not allow_chemicals:
         weather_facts["safest_window_summary_bn"] = None
 
     return {
@@ -446,11 +448,7 @@ def _build_facts(
             "cultural_only": cultural_only,
             "refer_to_officer": refer_to_officer,
             "is_healthy": is_healthy,
-            "ppe_reminder": (
-                grounding.ppe_reminder_bn
-                if (confirmed and not cultural_only and not is_healthy)
-                else None
-            ),
+            "ppe_reminder": grounding.ppe_reminder_bn if allow_chemicals else None,
             "passages": passages,
         },
     }
@@ -504,12 +502,19 @@ def _build_result(
         if grounding.sources
         else (is_healthy or not disease["chemical"])
     )
+    allow_chemicals = confirmed and not cultural_only and not is_healthy
     refer_to_officer = (not confirmed) or grounding.refer_to_officer
     ppe_reminder = (
-        grounding.ppe_reminder_bn
-        if (confirmed and not cultural_only and not is_healthy and grounding.ppe_reminder_bn)
-        else None
+        grounding.ppe_reminder_bn if (allow_chemicals and grounding.ppe_reminder_bn) else None
     )
+    chemical_chunk_ids = {
+        chunk["chunk_id"] for chunk in grounding.chunks if chunk.get("chemicals")
+    }
+    visible_sources = [
+        source
+        for source in grounding.sources
+        if allow_chemicals or source.chunk_id not in chemical_chunk_ids
+    ]
 
     if confirmed:
         if is_healthy:
@@ -565,13 +570,11 @@ def _build_result(
                 confirmed=confirmed,
                 cultural_only=cultural_only or is_healthy,
             ),
-            "source": (
-                grounding.sources[0].source_title if grounding.sources else disease["source"]
-            ),
+            "source": visible_sources[0].source_title if visible_sources else disease["source"],
         },
         "prevention": disease["prevention"],
         "needsProfessionalVerification": True,
-        "ragSources": [source.to_contract_dict() for source in grounding.sources],
+        "ragSources": [source.to_contract_dict() for source in visible_sources],
         "ppeReminder": ppe_reminder,
         "referToOfficer": refer_to_officer,
         "uncertainty": {

@@ -11,6 +11,8 @@ import logging
 import re
 from typing import Any
 
+import httpx
+
 from ..config import Settings
 from .writer import (
     _RETRYABLE_GEMINI_CODES,
@@ -68,7 +70,10 @@ def _transcribe_blocking(
     from google.genai import types
 
     audio_part = types.Part.from_bytes(data=audio_bytes, mime_type=mime_type)
-    config = types.GenerateContentConfig(temperature=0.0)
+    config = types.GenerateContentConfig(
+        temperature=0.0,
+        automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
+    )
 
     last_exc: Exception | None = None
     for model_name in _candidate_models(settings):
@@ -90,6 +95,14 @@ def _transcribe_blocking(
                 )
                 continue
             raise
+        except (TimeoutError, httpx.TimeoutException) as exc:
+            last_exc = exc
+            log.warning(
+                "Audio transcription model %s timed out (%s); trying fallback.",
+                model_name,
+                exc.__class__.__name__,
+            )
+            continue
 
     raise RuntimeError(f"All Gemini Flash models failed for audio: {last_exc}") from last_exc
 

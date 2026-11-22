@@ -373,3 +373,54 @@ def test_pipeline_surfaces_rag_fields_in_api_result(
             assert result.ppeReminder
         else:
             assert result.ppeReminder is None
+
+
+def test_unconfirmed_potato_hides_chemical_rag_prose_and_sources(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(settings, "gemini_api_key", "")
+    monkeypatch.setattr(settings, "llm_api_key", "")
+    rag.reset_rag_cache()
+
+    disease = knowledge_base.get_disease("potato_late_blight")
+    assert disease is not None
+
+    question = "আমার আলুর পাতায় কালো দাগ পড়ছে, এখন কী ওষুধ দেব?"
+    bundle = rag.retrieve_grounding_bundle("potato_late_blight", "potato", question, top_k=3)
+    assert any(chunk.get("chemicals") for chunk in bundle.chunks)
+
+    vision = VisionFacts(
+        status="undetermined",
+        label=None,
+        confidence=None,
+        crop_id=None,
+        disease_id=None,
+        is_healthy=False,
+        model=None,
+    )
+    facts = pipeline._build_facts(
+        disease,
+        weather=None,
+        vision=vision,
+        confirmed=False,
+        grounding=bundle,
+        farmer_question=question,
+    )
+    assert facts["treatment"]["chemical"] == []
+    assert [p["chunk_id"] for p in facts["rag_grounding"]["passages"]] == [
+        "bari_potato_late_blight_01"
+    ]
+    assert all("ম্যানকোজেব" not in p["content_bn"] for p in facts["rag_grounding"]["passages"])
+
+    result = pipeline._build_result(
+        "test-id",
+        disease,
+        weather=None,
+        narrative="আপনার আলু গাছের ছবি শনাক্ত করা যায়নি। আনুমানিক পরামর্শ।",
+        generated_by="template",
+        vision=vision,
+        confirmed=False,
+        grounding=bundle,
+        farmer_question=question,
+    )
+    assert [s["chunkId"] for s in result["ragSources"]] == ["bari_potato_late_blight_01"]
