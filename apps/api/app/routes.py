@@ -26,7 +26,7 @@ from .contracts import (
 from .grounding import knowledge_base
 from .grounding.districts import DISTRICTS, get_district
 from .jobs import pipeline
-from .tts.engine import get_engine
+from .tts.engine import audio_mime, get_engine
 from .vision.classifier import get_classifier
 
 router = APIRouter()
@@ -270,7 +270,7 @@ async def get_audio(analysis_id: str) -> Any:
     if path is None or not path.exists():
         raise HTTPException(status_code=404, detail="audio_not_found")
 
-    media_type = "audio/ogg" if path.suffix == ".opus" else "audio/mpeg"
+    media_type = audio_mime(path)
     return FileResponse(
         path,
         media_type=media_type,
@@ -284,7 +284,7 @@ async def delete_analysis(analysis_id: str) -> None:
     if row is None:
         raise HTTPException(status_code=404, detail="analysis_not_found")
     (settings.images_dir / f"{analysis_id}.jpg").unlink(missing_ok=True)
-    for suffix in ("opus", "mp3"):
+    for suffix in ("opus", "mp3", "wav"):
         (settings.audio_dir / f"{analysis_id}.{suffix}").unlink(missing_ok=True)
     async with store.connect() as db:
         await db.execute("DELETE FROM analyses WHERE id = ?", (analysis_id,))

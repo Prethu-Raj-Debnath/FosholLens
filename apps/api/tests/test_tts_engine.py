@@ -111,3 +111,108 @@ async def test_prepare_runs_before_synthesis(
 
     await engine.synthesise("মাত্রা ২ মিলি/লিটার", tmp_path)
     assert seen == ["মাত্রা ২ মিলি প্রতি লিটার"]
+
+
+async def test_wav_fallback_when_ffmpeg_missing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import wave
+
+    import numpy as np
+
+    monkeypatch.setattr(engine_module.settings, "tts_enabled", True)
+    monkeypatch.setattr(engine_module.settings, "tts_format", "opus")
+    monkeypatch.setattr(engine_module.settings, "ffmpeg_path", "ffmpeg")
+    monkeypatch.setattr(engine_module.shutil, "which", lambda _cmd: None)
+
+    eng = TtsEngine()
+    assert eng.available is True
+
+    class StubTts:
+        def synthesize(self, _text: str, voice: str = "female") -> np.ndarray:
+            return np.zeros(24_000, dtype=np.float32)
+
+    eng._tts = StubTts()
+    clip = await eng.synthesise("আপনার ধান গাছ সুস্থ আছে।", tmp_path)
+
+    assert clip.path.suffix == ".wav"
+    assert clip.path.exists()
+    assert clip.mime == "audio/wav"
+    assert clip.duration_ms == 1000
+    assert clip.byte_size > 44
+    with wave.open(str(clip.path), "rb") as handle:
+        assert handle.getnchannels() == 1
+        assert handle.getsampwidth() == 2
+        assert handle.getframerate() == 24_000
+
+
+def test_get_audio_serves_wav_with_200_and_audio_wav_mime(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import io
+    import time
+
+    import numpy as np
+    from fastapi.testclient import TestClient
+    from PIL import Image
+
+    from app.config import settings
+    from app.llm.writer import reset_writer
+    from app.main import app
+
+    storage = tmp_path / "storage"
+    monkeypatch.setattr(settings, "database_path", storage / "test.db")
+    monkeypatch.setattr(settings, "storage_dir", storage)
+    monkeypatch.setattr(settings, "tts_enabled", True)
+    monkeypatch.setattr(settings, "tts_format", "opus")
+    monkeypatch.setattr(settings, "vision_enabled", False)
+    monkeypatch.setattr(settings, "gemini_api_key", "")
+    monkeypatch.setattr(settings, "llm_api_key", "")
+    monkeypatch.setattr(engine_module.shutil, "which", lambda _cmd: None)
+    for directory in (settings.images_dir, settings.audio_dir):
+        directory.mkdir(parents=True, exist_ok=True)
+
+    reset_writer()
+    engine_module.get_engine.cache_clear()
+    eng = engine_module.get_engine()
+
+    class StubTts:
+        def synthesize(self, _text: str, voice: str = "female") -> np.ndarray:
+            return np.zeros(12_000, dtype=np.float32)
+
+    eng._tts = StubTts()
+
+    buf = io.BytesIO()
+    Image.new("RGB", (64, 64), (40, 120, 60)).save(buf, format="JPEG")
+
+    try:
+        with TestClient(app) as client:
+            created = client.post(
+                "/api/v1/analyses",
+                files={"image": ("crop.jpg", buf.getvalue(), "image/jpeg")},
+                data={"crop": "rice"},
+            )
+            assert created.status_code == 202
+            analysis_id = created.json()["id"]
+
+            deadline = time.monotonic() + 15.0
+            while time.monotonic() < deadline:
+                summary = client.get(f"/api/v1/analyses/{analysis_id}").json()
+                if summary["status"] == "completed" and summary["stage"] == "done":
+                    break
+                time.sleep(0.05)
+            else:
+                raise AssertionError("TTS background task did not finish")
+
+            result = client.get(f"/api/v1/analyses/{analysis_id}/result").json()
+            assert result["audio"]["status"] == "ready"
+            assert result["audio"]["url"] == f"/api/v1/analyses/{analysis_id}/audio"
+            assert list(settings.audio_dir.glob("*.wav"))
+
+            audio_resp = client.get(f"/api/v1/analyses/{analysis_id}/audio")
+            assert audio_resp.status_code == 200
+            assert audio_resp.headers["content-type"] == "audio/wav"
+            assert audio_resp.content.startswith(b"RIFF")
+    finally:
+        engine_module.get_engine.cache_clear()
+        reset_writer()

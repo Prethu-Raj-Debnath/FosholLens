@@ -28,20 +28,21 @@ _LATIN_RE = re.compile(r"[A-Za-z]")
 def _make_48h_payload(
     *,
     start: datetime | None = None,
+    hours: int = 48,
     rain_prob: list[int] | None = None,
     rain_mm: list[float] | None = None,
     wind: list[float] | None = None,
     humidity: list[int] | None = None,
 ) -> dict:
     start_dt = start or datetime(2026, 11, 22, 6, 0, tzinfo=_DHAKA_TZ)
-    times = [(start_dt + timedelta(hours=i)).isoformat(timespec="minutes") for i in range(48)]
+    times = [(start_dt + timedelta(hours=i)).isoformat(timespec="minutes") for i in range(hours)]
     return {
         "hourly": {
             "time": times,
-            "precipitation_probability": rain_prob if rain_prob is not None else [10] * 48,
-            "precipitation": rain_mm if rain_mm is not None else [0.0] * 48,
-            "wind_speed_10m": wind if wind is not None else [5.0] * 48,
-            "relative_humidity_2m": humidity if humidity is not None else [70] * 48,
+            "precipitation_probability": rain_prob if rain_prob is not None else [10] * hours,
+            "precipitation": rain_mm if rain_mm is not None else [0.0] * hours,
+            "wind_speed_10m": wind if wind is not None else [5.0] * hours,
+            "relative_humidity_2m": humidity if humidity is not None else [70] * hours,
         }
     }
 
@@ -63,7 +64,8 @@ def _wait(client: TestClient, analysis_id: str, timeout: float = 20.0) -> dict:
 
 
 def test_classify_produces_48_windows_validating_contract() -> None:
-    facts = classify(_make_48h_payload(), "dhaka", "ঢাকা")
+    start = datetime(2026, 11, 22, 6, 0, tzinfo=_DHAKA_TZ)
+    facts = classify(_make_48h_payload(start=start), "dhaka", "ঢাকা", now=start)
     assert len(facts.hourly_windows) == 48
     assert all(w.safety == "green" for w in facts.hourly_windows)
     assert facts.safest_window_summary_bn
@@ -95,10 +97,12 @@ def test_deterministic_green_amber_red_thresholds() -> None:
     # Isolated high wind triggers red without wash-off lookahead bleeding backward.
     winds[30] = 15.0
 
+    start = datetime(2026, 11, 22, 6, 0, tzinfo=_DHAKA_TZ)
     facts = classify(
-        _make_48h_payload(rain_prob=probs, rain_mm=mms, wind=winds),
+        _make_48h_payload(start=start, rain_prob=probs, rain_mm=mms, wind=winds),
         "bogura",
         "বগুড়া",
+        now=start,
     )
     windows = facts.hourly_windows
 
@@ -118,7 +122,13 @@ def test_three_hour_washoff_lookahead_marks_prior_hours_red() -> None:
     probs[10] = 65
     mms[25] = 1.2
 
-    facts = classify(_make_48h_payload(rain_prob=probs, rain_mm=mms), "sylhet", "সিলেট")
+    start = datetime(2026, 11, 22, 6, 0, tzinfo=_DHAKA_TZ)
+    facts = classify(
+        _make_48h_payload(start=start, rain_prob=probs, rain_mm=mms),
+        "sylhet",
+        "সিলেট",
+        now=start,
+    )
     windows = facts.hourly_windows
 
     # Hour 6 is 4h before rain at hour 10 -> stays green.
@@ -148,7 +158,7 @@ def test_safest_window_prefers_daylight_block_and_contains_no_latin() -> None:
     for h in range(15, 21):
         probs[h] = 10
 
-    facts = classify(_make_48h_payload(start=start, rain_prob=probs), "dhaka", "ঢাকা")
+    facts = classify(_make_48h_payload(start=start, rain_prob=probs), "dhaka", "ঢাকা", now=start)
     summary = facts.safest_window_summary_bn
     assert summary is not None
     assert not _LATIN_RE.search(summary)
@@ -161,14 +171,16 @@ def test_safest_window_prefers_daylight_block_and_contains_no_latin() -> None:
     for h in range(30, 37):
         probs_tomorrow[h] = 10
     facts_tomorrow = classify(
-        _make_48h_payload(start=start, rain_prob=probs_tomorrow), "dhaka", "ঢাকা"
+        _make_48h_payload(start=start, rain_prob=probs_tomorrow), "dhaka", "ঢাকা", now=start
     )
     assert facts_tomorrow.safest_window_summary_bn is not None
     assert not _LATIN_RE.search(facts_tomorrow.safest_window_summary_bn)
     assert "আগামীকাল সকাল ৬টা থেকে ১০টা" in facts_tomorrow.safest_window_summary_bn
 
     # When no daylight green exists across 48h, returns pure Bangla wait note:
-    facts_none = classify(_make_48h_payload(start=start, rain_prob=[80] * 48), "dhaka", "ঢাকা")
+    facts_none = classify(
+        _make_48h_payload(start=start, rain_prob=[80] * 48), "dhaka", "ঢাকা", now=start
+    )
     assert facts_none.safest_window_summary_bn is not None
     assert not _LATIN_RE.search(facts_none.safest_window_summary_bn)
     assert "নিরাপদ স্প্রে সময় নেই" in facts_none.safest_window_summary_bn
@@ -182,7 +194,9 @@ def test_pipeline_passes_safest_window_only_when_spraying_is_applicable(
     probs = [85] * 48
     for idx in range(24, 28):
         probs[idx] = 5
-    weather_facts = classify(_make_48h_payload(start=start, rain_prob=probs), "dhaka", "ঢাকা")
+    weather_facts = classify(
+        _make_48h_payload(start=start, rain_prob=probs), "dhaka", "ঢাকা", now=start
+    )
     assert weather_facts.spray_window_ok is False
     assert weather_facts.safest_window_summary_bn
 
@@ -301,3 +315,83 @@ def test_pipeline_passes_safest_window_only_when_spraying_is_applicable(
     # TemplateWriter must never suggest spraying for healthy or cultural_only.
     healthy_narrative = TemplateWriter().compose(healthy_facts)
     assert "সবচেয়ে নিরাপদ স্প্রে সময়" not in healthy_narrative
+
+
+def test_classify_excludes_past_hours_and_never_recommends_past_window() -> None:
+    """With forecast_days=3 at 22:00 Dhaka time, past hours 00..21 are excluded."""
+    day_start = datetime(2026, 11, 22, 0, 0)  # naive ISO as returned by Open-Meteo
+    hours = 72
+    probs = [80] * hours
+    # Make today morning 06:00-11:59 green (in the past once now=22:00).
+    for h in range(6, 12):
+        probs[h] = 5
+    # Make tomorrow 07:00-10:59 green (indices 31..34) with 35..37 dry lookahead buffer.
+    for h in range(31, 38):
+        probs[h] = 5
+
+    times = [(day_start + timedelta(hours=i)).strftime("%Y-%m-%dT%H:%M") for i in range(hours)]
+    payload = {
+        "hourly": {
+            "time": times,
+            "precipitation_probability": probs,
+            "precipitation": [0.0] * hours,
+            "wind_speed_10m": [5.0] * hours,
+            "relative_humidity_2m": [70] * hours,
+        }
+    }
+
+    now = datetime(2026, 11, 22, 22, 15, tzinfo=_DHAKA_TZ)
+    facts = classify(payload, "dhaka", "ঢাকা", now=now)
+
+    assert len(facts.hourly_windows) == 48
+    assert facts.hourly_windows[0].time_iso == "2026-11-22T22:00"
+    assert facts.hourly_windows[-1].time_iso == "2026-11-24T21:00"
+    # First 12 future hours (22:00..09:00) include rain probability 80, NOT morning 5.
+    assert facts.rain_probability == 80
+    assert facts.spray_window_ok is False
+    # Safest window must pick tomorrow morning (07:00-11:00), never today's past 06:00.
+    assert facts.safest_window_summary_bn is not None
+    assert "আগামীকাল সকাল ৭টা থেকে ১১টা" in facts.safest_window_summary_bn
+    assert "আজ সকাল" not in facts.safest_window_summary_bn
+
+
+async def test_fetch_weather_requests_three_forecast_days(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.grounding import weather as weather_module
+
+    weather_module._cache.clear()
+    seen_params: list[dict] = []
+    start = datetime.now(_DHAKA_TZ).replace(minute=0, second=0, microsecond=0) - timedelta(hours=3)
+    payload = _make_48h_payload(start=start, hours=72)
+
+    class FakeResponse:
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict:
+            return payload
+
+    class FakeClient:
+        def __init__(self, **_kwargs) -> None:
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args) -> None:
+            return None
+
+        async def get(self, _url: str, params: dict) -> FakeResponse:
+            seen_params.append(params)
+            return FakeResponse()
+
+    monkeypatch.setattr(weather_module.httpx, "AsyncClient", FakeClient)
+
+    facts = await weather_module.fetch_weather(23.8103, 90.4125, "dhaka", "ঢাকা")
+    assert facts is not None
+    assert seen_params[0]["forecast_days"] == 3
+    assert seen_params[0]["timezone"] == "Asia/Dhaka"
+    assert len(facts.hourly_windows) == 48
+    first_dt = weather_module._parse_dhaka_dt(facts.hourly_windows[0].time_iso)
+    assert first_dt >= weather_module._current_dhaka_hour()

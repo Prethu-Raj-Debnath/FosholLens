@@ -29,6 +29,7 @@ from .models import ModelSpec, get_spec
 log = logging.getLogger(__name__)
 
 VisionStatus = Literal["identified", "undetermined", "unavailable"]
+RAW_MIN_CONFIDENCE = 0.35
 
 
 class VisionFacts(TypedDict):
@@ -220,43 +221,78 @@ def _softmax(logits: Any) -> Any:
 
 
 def _decide(probabilities: Any, crop_id: str, spec: ModelSpec) -> VisionFacts:
-    """Turn probabilities into facts, applying the threshold to raw mass.
+    """Turn probabilities into facts, logging top-3 and scoping to selected crop.
 
-    The threshold is deliberately compared against the *unfiltered* probability
-    of the winning class. Renormalising onto the requested crop's classes first
-    and then thresholding — the tempting shortcut — lets a corn leaf clear 0.55
-    as "rice blast" whenever the rice classes merely outscore the corn ones,
-    because the renormalisation throws away the evidence that the whole photo
-    was a different crop.
+    Raw max-class probability is checked first so clear predictions (or high-
+    confidence non-diagnostic/wrong-crop photos) act directly. When softmax mass
+    splits across rice/potato classes on an in-crop photo, we renormalise within
+    the requested crop only if raw top-class confidence still clears
+    `RAW_MIN_CONFIDENCE` (so blurry/non-leaf images stay undetermined).
     """
-    index = int(probabilities.argmax())
-    label = spec["labels"][index]
-    confidence = float(probabilities[index])
+    import numpy as np
 
-    if confidence < settings.vision_confidence_threshold:
+    labels = spec["labels"]
+    probs = np.asarray(probabilities, dtype=np.float64)
+    ranked = np.argsort(probs)[::-1]
+    top3 = ", ".join(f"{labels[int(i)]}={float(probs[int(i)]):.3f}" for i in ranked[:3])
+
+    raw_index = int(ranked[0])
+    raw_label = labels[raw_index]
+    raw_conf = float(probs[raw_index])
+
+    crop_indices = [i for i, lbl in enumerate(labels) if spec["label_crop"].get(lbl) == crop_id]
+    crop_mass = float(sum(float(probs[i]) for i in crop_indices)) if crop_indices else 0.0
+    other_mass = float(sum(float(probs[i]) for i in range(len(labels)) if i not in crop_indices))
+    denom = max(1.0 - other_mass, crop_mass)
+
+    crop_best_label: str | None = None
+    crop_scoped_conf = 0.0
+    if crop_indices:
+        crop_best_idx = max(crop_indices, key=lambda i: float(probs[i]))
+        crop_best_label = labels[crop_best_idx]
+        crop_scoped_conf = (float(probs[crop_best_idx]) / denom) if denom > 0.0 else 0.0
+
+    log.info(
+        "vision top3 (%s, crop=%s): %s | crop_mass=%.3f crop_top=%s(%.3f)",
+        spec["id"],
+        crop_id,
+        top3,
+        crop_mass,
+        crop_best_label or "none",
+        crop_scoped_conf,
+    )
+
+    threshold = settings.vision_confidence_threshold
+    raw_floor = min(RAW_MIN_CONFIDENCE, threshold)
+
+    if raw_conf >= threshold:
+        return _identify_if_supported(raw_label, raw_conf, crop_id, spec)
+
+    if (
+        crop_best_label is not None
+        and raw_conf >= raw_floor
+        and crop_mass >= raw_floor
+        and crop_scoped_conf >= threshold
+    ):
+        return _identify_if_supported(crop_best_label, crop_scoped_conf, crop_id, spec)
+
+    return _undetermined(raw_label, raw_conf, spec)
+
+
+def _identify_if_supported(
+    label: str, confidence: float, crop_id: str, spec: ModelSpec
+) -> VisionFacts:
+    """Resolve a winning label to a KB diagnosis or fall back to undetermined."""
+    if label in spec["non_diagnostic"] or spec["label_crop"].get(label) != crop_id:
         return _undetermined(label, confidence, spec)
-
-    if label in spec["non_diagnostic"]:
-        return _undetermined(label, confidence, spec)
-
-    label_crop = spec["label_crop"].get(label)
-    if label_crop != crop_id:
-        # Wrong crop in frame, or a crop this checkpoint cannot name. Either way
-        # the answer says nothing about the leaf the farmer photographed.
-        return _undetermined(label, confidence, spec)
-
     disease_id = spec["label_disease"].get(label)
     if disease_id is None:
-        # A label the checkpoint can name but the knowledge base has no sourced
-        # advice for (corn and wheat, on the deprecated ViT). Reporting it would
-        # mean inventing treatment, so it stays a miss.
         return _undetermined(label, confidence, spec)
-
     return VisionFacts(
         status="identified",
         label=label,
         confidence=confidence,
-        crop_id=label_crop,
+        crop_id=crop_id,
         disease_id=disease_id,
         is_healthy=label in spec["healthy"],
         model=spec["id"],

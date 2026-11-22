@@ -326,6 +326,11 @@ async def _speak_inner(
 ) -> None:
     engine = get_engine()
     if not engine.available:
+        log.warning(
+            "TTS disabled/unavailable for %s (tts_enabled=%s)",
+            analysis_id,
+            settings.tts_enabled,
+        )
         await store.update_audio(analysis_id, {"status": "failed", "url": None})
         return
 
@@ -342,8 +347,14 @@ async def _speak_inner(
         log.error("TTS refused to synthesise for %s: %s", analysis_id, exc)
         await store.update_audio(analysis_id, {"status": "failed", "url": None})
         return
-    except Exception as exc:  # noqa: BLE001
-        log.warning("TTS failed for %s: %s", analysis_id, exc.__class__.__name__)
+    except Exception as exc:
+        log.warning(
+            "TTS failed for %s: %s: %s",
+            analysis_id,
+            exc.__class__.__name__,
+            str(exc) or "no detail",
+            exc_info=True,
+        )
         await store.update_audio(analysis_id, {"status": "failed", "url": None})
         return
 

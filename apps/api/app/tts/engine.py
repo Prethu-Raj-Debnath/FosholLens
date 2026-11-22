@@ -28,6 +28,7 @@ import wave
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
+from typing import Any
 
 from ..config import settings
 
@@ -129,6 +130,28 @@ def _encode(wav_path: Path, target: Path) -> int:
     return target.stat().st_size
 
 
+def _has_ffmpeg() -> bool:
+    return shutil.which(settings.ffmpeg_path) is not None
+
+
+def _effective_format() -> str:
+    return settings.tts_format if _has_ffmpeg() else "wav"
+
+
+def _write_wav(samples: Any, dest: Path) -> None:
+    import numpy as np
+
+    tmp_path = dest.with_name(f"{dest.name}.tmp")
+    clipped = np.clip(np.asarray(samples), -1.0, 1.0)
+    pcm = (clipped * 32767).astype("<i2")
+    with wave.open(str(tmp_path), "wb") as handle:
+        handle.setnchannels(1)
+        handle.setsampwidth(2)
+        handle.setframerate(SAMPLE_RATE)
+        handle.writeframes(pcm.tobytes())
+    tmp_path.replace(dest)
+
+
 class TtsEngine:
     def __init__(self) -> None:
         self._tts: object | None = None
@@ -140,7 +163,7 @@ class TtsEngine:
 
     @property
     def available(self) -> bool:
-        return settings.tts_enabled and shutil.which(settings.ffmpeg_path) is not None
+        return settings.tts_enabled
 
     def _load(self) -> object:
         """Download (once) and load the ONNX model. Blocking."""
@@ -170,52 +193,73 @@ class TtsEngine:
         self, text: str, out_dir: Path, required_terms: list[str] | None = None
     ) -> AudioClip:
         """Synthesise to a cached file. Blocking work runs off the event loop."""
+        out_dir.mkdir(parents=True, exist_ok=True)
         prepared = prepare_text(text, required_terms)
+        fmt = _effective_format()
         digest = hashlib.sha256(
-            f"{prepared}|{settings.tts_voice}|{settings.tts_format}".encode()
+            f"{prepared}|{settings.tts_voice}|{fmt}".encode()
         ).hexdigest()[:24]
 
-        target = out_dir / f"{digest}.{settings.tts_format}"
+        target = out_dir / f"{digest}.{fmt}"
         if target.exists():
-            return AudioClip(target, _duration_ms(target), target.stat().st_size, _mime(target))
+            return AudioClip(
+                target, _duration_ms(target), target.stat().st_size, audio_mime(target)
+            )
 
         await self.ensure_loaded()
         async with self._synth_lock:
             # Re-check inside the lock: another request may have produced the
             # same clip while this one waited.
             if target.exists():
-                return AudioClip(target, _duration_ms(target), target.stat().st_size, _mime(target))
+                return AudioClip(
+                    target, _duration_ms(target), target.stat().st_size, audio_mime(target)
+                )
             return await asyncio.to_thread(self._synthesise_blocking, prepared, out_dir, target)
 
     def _synthesise_blocking(self, prepared: str, out_dir: Path, target: Path) -> AudioClip:
-        import numpy as np
-
         if self._tts is None:
             # A real check, not an assert: `python -O` strips asserts.
             raise TtsUnavailable("TTS model not loaded")
         wav = self._tts.synthesize(prepared, voice=settings.tts_voice)  # type: ignore[attr-defined]
 
-        raw = out_dir / f"{target.stem}.wav"
-        with wave.open(str(raw), "wb") as handle:
-            handle.setnchannels(1)
-            handle.setsampwidth(2)
-            handle.setframerate(SAMPLE_RATE)
-            samples = np.clip(np.asarray(wav), -1.0, 1.0)
-            handle.writeframes((samples * 32767).astype("<i2").tobytes())
+        if target.suffix == ".wav":
+            _write_wav(wav, target)
+            log.info("ffmpeg not found; generated WAV audio clip %s", target.name)
+            return AudioClip(
+                target, _duration_ms(target), target.stat().st_size, audio_mime(target)
+            )
 
+        raw = out_dir / f"{target.stem}.wav"
+        _write_wav(wav, raw)
         try:
             size = _encode(raw, target)
-        finally:
-            raw.unlink(missing_ok=True)
+        except TtsUnavailable as exc:
+            log.warning("ffmpeg encoding failed (%s); falling back to WAV %s", exc, raw.name)
+            return AudioClip(raw, _duration_ms(raw), raw.stat().st_size, audio_mime(raw))
+        raw.unlink(missing_ok=True)
 
-        return AudioClip(target, _duration_ms(target), size, _mime(target))
+        return AudioClip(target, _duration_ms(target), size, audio_mime(target))
 
 
-def _mime(path: Path) -> str:
-    return "audio/ogg" if path.suffix == ".opus" else "audio/mpeg"
+def audio_mime(path: Path) -> str:
+    if path.suffix == ".opus":
+        return "audio/ogg"
+    if path.suffix == ".wav":
+        return "audio/wav"
+    return "audio/mpeg"
+
+
+_mime = audio_mime
 
 
 def _duration_ms(path: Path) -> int:
+    if path.suffix == ".wav":
+        try:
+            with wave.open(str(path), "rb") as handle:
+                rate = handle.getframerate()
+                return round((handle.getnframes() / rate) * 1000) if rate > 0 else 0
+        except (wave.Error, OSError, EOFError):
+            return 0
     ffprobe = shutil.which("ffprobe")
     if not ffprobe:
         return 0

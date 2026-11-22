@@ -11,8 +11,9 @@ from __future__ import annotations
 import logging
 import time
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone, tzinfo
 from typing import Any, Literal
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import httpx
 
@@ -37,7 +38,28 @@ DAYLIGHT_START_HOUR = 6
 DAYLIGHT_END_HOUR = 18
 
 HUMIDITY_FIELD = "relative_humidity_2m"
-_DHAKA_TZ = timezone(timedelta(hours=6))
+
+
+def _dhaka_tz() -> tzinfo:
+    try:
+        return ZoneInfo("Asia/Dhaka")
+    except ZoneInfoNotFoundError:
+        return timezone(timedelta(hours=6))
+
+
+_DHAKA_TZ = _dhaka_tz()
+
+
+def _current_dhaka_hour() -> datetime:
+    return datetime.now(_dhaka_tz()).replace(minute=0, second=0, microsecond=0)
+
+
+def _parse_dhaka_dt(raw: str) -> datetime:
+    parsed = datetime.fromisoformat(raw)
+    tz = _dhaka_tz()
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=tz)
+    return parsed.astimezone(tz)
 
 SpraySafety = Literal["green", "amber", "red"]
 
@@ -217,16 +239,20 @@ def _day_label_bn(day_offset: int) -> str:
     return "পরশু"
 
 
-def _compute_safest_window_summary_bn(windows: tuple[HourlySprayWindow, ...]) -> str | None:
+def _compute_safest_window_summary_bn(
+    windows: tuple[HourlySprayWindow, ...],
+    *,
+    reference_date: date | None = None,
+) -> str | None:
     if not windows:
         return None
 
     try:
-        parsed = [(w, datetime.fromisoformat(w.time_iso)) for w in windows]
+        parsed = [(w, _parse_dhaka_dt(w.time_iso)) for w in windows]
     except ValueError:
         return None
 
-    first_date = parsed[0][1].date()
+    first_date = reference_date if reference_date is not None else parsed[0][1].date()
 
     blocks: list[list[tuple[int, datetime]]] = []
     current: list[tuple[int, datetime]] = []
@@ -265,22 +291,69 @@ def _compute_safest_window_summary_bn(windows: tuple[HourlySprayWindow, ...]) ->
     return f"সবচেয়ে নিরাপদ স্প্রে সময়: {day_bn} {start_bn} থেকে {end_bn}"
 
 
-def classify(payload: dict[str, Any], district_id: str, district_name: str) -> WeatherFacts:
+def _slice_future_hourly(hourly: dict[str, Any], current_hour: datetime) -> dict[str, Any]:
+    raw_times = hourly.get("time")
+    if not raw_times:
+        return hourly
+
+    start_idx: int | None = None
+    for idx, raw_time in enumerate(raw_times):
+        try:
+            slot_dt = _parse_dhaka_dt(str(raw_time))
+        except ValueError:
+            continue
+        if slot_dt >= current_hour:
+            start_idx = idx
+            break
+
+    if start_idx is None:
+        return {
+            key: ([] if isinstance(value, list) else value)
+            for key, value in hourly.items()
+        }
+
+    end_idx = start_idx + TIMELINE_HOURS
+    return {
+        key: (value[start_idx:end_idx] if isinstance(value, list) else value)
+        for key, value in hourly.items()
+    }
+
+
+def classify(
+    payload: dict[str, Any],
+    district_id: str,
+    district_name: str,
+    *,
+    now: datetime | None = None,
+) -> WeatherFacts:
     """Turn an Open-Meteo response into facts. Split out so it is testable."""
-    hourly = payload["hourly"]
-    rain_series: list[int] = hourly["precipitation_probability"][:HORIZON_HOURS]
-    wind_series: list[float] = hourly["wind_speed_10m"][:HORIZON_HOURS]
-    humidity_series: list[int] = hourly[HUMIDITY_FIELD][:HORIZON_HOURS]
+    tz = _dhaka_tz()
+    if now is None:
+        current_hour = _current_dhaka_hour()
+    elif now.tzinfo is None:
+        current_hour = now.replace(tzinfo=tz, minute=0, second=0, microsecond=0)
+    else:
+        current_hour = now.astimezone(tz).replace(minute=0, second=0, microsecond=0)
+
+    hourly = _slice_future_hourly(payload["hourly"], current_hour)
+    rain_series: list[int | None] = list(hourly.get("precipitation_probability") or [])[
+        :HORIZON_HOURS
+    ]
+    wind_series: list[float | None] = list(hourly.get("wind_speed_10m") or [])[:HORIZON_HOURS]
+    raw_humidity: list[int | None] = list(hourly.get(HUMIDITY_FIELD) or [])[:HORIZON_HOURS]
+    humidity_values = [h for h in raw_humidity if h is not None]
 
     # None means "model not confident"; treat a missing value as non-blocking
     # rather than inventing bad weather.
     rain = max((value for value in rain_series if value is not None), default=0)
     wind = max((value for value in wind_series if value is not None), default=0.0)
-    humidity = round(sum(humidity_series) / len(humidity_series)) if humidity_series else 0
+    humidity = round(sum(humidity_values) / len(humidity_values)) if humidity_values else 0
 
     ok, reason = _decide(rain, wind)
     windows = _build_timeline(hourly)
-    safest_summary = _compute_safest_window_summary_bn(windows)
+    safest_summary = _compute_safest_window_summary_bn(
+        windows, reference_date=current_hour.date()
+    )
 
     return WeatherFacts(
         district_id=district_id,
@@ -298,12 +371,14 @@ def classify(payload: dict[str, Any], district_id: str, district_name: str) -> W
 async def fetch_weather(
     latitude: float, longitude: float, district_id: str, district_name: str
 ) -> WeatherFacts | None:
-    """Fetch 48h of weather. Returns None on any failure - weather is optional.
+    """Fetch 48h of future weather. Returns None on any failure - weather is optional.
 
     A missing weather block means the LLM is told not to mention weather at all,
     which is honest. An invented forecast is not.
     """
-    cached = _cache.get(district_id)
+    current_hour = _current_dhaka_hour()
+    cache_key = f"{district_id}:{current_hour.isoformat()}"
+    cached = _cache.get(cache_key)
     if cached and time.monotonic() - cached[0] < _cache_seconds:
         return cached[1]
 
@@ -311,7 +386,7 @@ async def fetch_weather(
         "latitude": latitude,
         "longitude": longitude,
         "hourly": f"precipitation_probability,precipitation,wind_speed_10m,{HUMIDITY_FIELD}",
-        "forecast_days": 2,
+        "forecast_days": 3,
         "timezone": "Asia/Dhaka",
     }
 
@@ -319,7 +394,7 @@ async def fetch_weather(
         async with httpx.AsyncClient(timeout=settings.weather_timeout_ms / 1000) as client:
             response = await client.get(f"{settings.open_meteo_base_url}/forecast", params=params)
             response.raise_for_status()
-            facts = classify(response.json(), district_id, district_name)
+            facts = classify(response.json(), district_id, district_name, now=current_hour)
     except (httpx.HTTPError, KeyError, TypeError, ValueError) as exc:
         # `str(ConnectTimeout())` is empty, so a bare %s logs nothing useful.
         # This is the only signal that a result lost its weather block.
@@ -331,5 +406,7 @@ async def fetch_weather(
         )
         return None
 
-    _cache[district_id] = (time.monotonic(), facts)
+    for old_key in [k for k in _cache if k.startswith(f"{district_id}:") and k != cache_key]:
+        _cache.pop(old_key, None)
+    _cache[cache_key] = (time.monotonic(), facts)
     return facts

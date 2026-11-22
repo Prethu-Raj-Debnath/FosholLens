@@ -339,3 +339,37 @@ def test_knowledge_base_has_no_entries_outside_supported_crops() -> None:
 
     for entry in knowledge_base.KB:
         assert entry["cropId"] in knowledge_base.SUPPORTED_CROPS, entry["id"]
+
+
+def test_logs_top3_probabilities_and_applies_crop_scoped_confidence(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    import logging
+
+    caplog.set_level(logging.INFO, logger="app.vision.classifier")
+
+    # Split-mass field photo: raw max is 0.354 (< 0.55), but potato classes hold 0.527
+    # so potato_early_blight has 0.354 / 0.527 = 0.672 within potato.
+    split_probs = _probs(
+        EFFICIENTNET,
+        potato_early_blight=0.354,
+        potato_late_blight=0.123,
+        potato_healthy=0.050,
+        rice_blast=0.166,
+        rice_other=0.139,
+        rice_brown_spot=0.168,
+    )
+    potato_facts = _decide(split_probs, "potato", EFFICIENTNET)
+    assert potato_facts["status"] == "identified"
+    assert potato_facts["disease_id"] == "potato_early_blight"
+    assert potato_facts["confidence"] == pytest.approx(0.354 / 0.527, rel=1e-3)
+    assert any("vision top3 (efficientnet, crop=potato)" in r.message for r in caplog.records)
+    assert any("potato_early_blight=0.354" in r.message for r in caplog.records)
+
+    # Same split distribution queried as rice has crop_top=rice_brown_spot (0.355 < 0.55) -> miss.
+    rice_facts = _decide(split_probs, "rice", EFFICIENTNET)
+    assert rice_facts["status"] == "undetermined"
+
+    # Truly uncertain / blurry uniform image (all 9 classes ~0.111, raw max < 0.35) -> miss.
+    uniform_probs = np.full(len(EFFICIENTNET["labels"]), 1.0 / len(EFFICIENTNET["labels"]))
+    assert _decide(uniform_probs, "potato", EFFICIENTNET)["status"] == "undetermined"
