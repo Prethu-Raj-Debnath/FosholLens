@@ -32,12 +32,6 @@ _TOKEN_RE = re.compile(r"[\u0980-\u09FF]+|[a-z0-9_]+")
 _VISION_ALIAS_MAP: dict[str, str] = {
     "rice_bacterial_blight": "rice_bacterial_leaf_blight",
     "rice_bacterial_leaf_blight": "rice_bacterial_leaf_blight",
-    "rice___leaf_blast": "rice_blast",
-    "rice___brown_spot": "rice_brown_spot",
-    "rice___healthy": "rice_healthy",
-    "potato___early_blight": "potato_early_blight",
-    "potato___late_blight": "potato_late_blight",
-    "potato___healthy": "potato_healthy",
 }
 
 _CROP_ALIAS_MAP: dict[str, str] = {
@@ -373,11 +367,6 @@ def _select_candidates(norm_disease: str, norm_crop: str, corpus: list[RagChunk]
         any_crop = [chunk for chunk in corpus if chunk["disease_id"] == norm_disease]
         if any_crop and (not norm_crop or norm_crop == "unknown"):
             return any_crop
-
-    # Out-of-scope or unrecognized rice symptom safely falls back to the DAE/BRRI
-    # no-blind-spray protocol.
-    if norm_crop == "rice":
-        return [chunk for chunk in corpus if chunk["disease_id"] == "rice_other"]
 
     return []
 

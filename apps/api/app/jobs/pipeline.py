@@ -253,28 +253,13 @@ def _resolve_disease(
     """Pick the KB entry the advice will be built on and whether it was confirmed.
 
     A classifier match wins — including a `healthy` match, which resolves to the
-    crop's healthy entry and carries no chemical. High-confidence `rice_other`
-    resolves to the BRRI/DAE no-blind-spray safety entry while remaining marked
-    unconfirmed. Everything else falls back to one curated entry per crop and is
-    marked unconfirmed downstream.
+    crop's healthy entry and carries no chemical. Everything else falls back to
+    one curated entry per crop and is marked unconfirmed downstream.
     """
     if vision["status"] == "identified" and vision["disease_id"]:
         matched = knowledge_base.get_disease(vision["disease_id"])
         if matched is not None:
-            return matched, matched["id"] != "rice_other"
-
-    label = vision.get("label")
-    confidence = vision.get("confidence")
-    if (
-        vision["status"] == "undetermined"
-        and label
-        and confidence is not None
-        and confidence >= settings.vision_confidence_threshold
-    ):
-        normalized = rag.normalize_disease_id(label)
-        matched = knowledge_base.get_disease(normalized)
-        if matched is not None and matched["cropId"] == crop_id:
-            return matched, matched["id"] != "rice_other"
+            return matched, True
 
     fallback_id = FALLBACK_DISEASE.get(crop_id)
     return (knowledge_base.get_disease(fallback_id) if fallback_id else None), False
@@ -540,12 +525,6 @@ def _build_result(
         else:
             summary = "নিচের ধাপগুলো অনুসরণ করুন"
             uncertainty_message = "এটি একটি আনুমানিক ফলাফল। নিশ্চিত হওয়ার জন্য কৃষি কর্মকর্তার পরামর্শ নিন।"
-    elif disease["id"] == "rice_other":
-        summary = "রোগ নিশ্চিত নয়, তাই আন্দাজে কোনো স্প্রে করবেন না"
-        uncertainty_message = (
-            "এই লক্ষণটি আওতাভুক্ত ৪টি ধান রোগের সাথে মেলেনি। আন্দাজে কোনো ওষুধ স্প্রে করবেন না; "
-            "আরও পরিষ্কার ছবি দিন অথবা স্থানীয় উপ-সহকারী কৃষি কর্মকর্তার পরামর্শ নিন।"
-        )
     else:
         summary = f"{disease['cropName']} ফসলের জন্য সাধারণ পরিচর্যা"
         uncertainty_message = (

@@ -47,19 +47,24 @@ class Settings(BaseSettings):
 
     # ---- vision (optional: without a model every diagnosis is unconfirmed)
     vision_enabled: bool = True
-    #: Which checkpoint to use.
-    #:   vit          - 13 classes, corn/potato/rice/wheat, downloaded from HF.
-    #:   efficientnet - 9 classes, rice/potato only, local file, ~3x faster.
-    #: Everything else that differs between them (label order, crop mapping,
-    #: preprocessing) lives in `vision/models.py`, so this is the only switch.
-    #: `efficientnet` is the shipped model; `vit` is deprecated and opt-in.
-    vision_model: Literal["vit", "efficientnet"] = "efficientnet"
-    #: Where a local checkpoint lives. Unused when the spec names a Hub repo.
+    #: Where the committed checkpoint lives.
     vision_model_dir: Path = API_ROOT / "models"
     #: Raw softmax probability below which a leaf is "not confidently
-    #: identified". Applied before any crop filtering, so a wrong-crop photo
-    #: cannot be renormalised into a confident answer.
-    vision_confidence_threshold: float = Field(default=0.55, ge=0.0, le=1.0)
+    #: identified". Applied to the winning class's unmasked probability, so a
+    #: wrong-crop photo cannot be renormalised into a confident answer.
+    vision_confidence_threshold: float = Field(default=0.6, ge=0.0, le=1.0)
+    #: Secondary acceptance path for clear winners that fall just below the main
+    #: threshold. A label is accepted when it beats the runner-up by this margin,
+    #: clears `vision_margin_floor`, and the photo is mostly the selected crop.
+    #: This cuts "not recognised" refusals on unambiguous photos without lowering
+    #: the bar for genuinely ambiguous ones.
+    vision_margin: float = Field(default=0.30, ge=0.0, le=1.0)
+    #: Minimum raw probability for the margin path. Below this, even a large gap
+    #: is not enough evidence.
+    vision_margin_floor: float = Field(default=0.45, ge=0.0, le=1.0)
+    #: Minimum share of the model's belief in the selected crop for the margin
+    #: path. A confident wrong-crop photo must not sneak through.
+    vision_margin_min_crop_mass: float = Field(default=0.70, ge=0.0, le=1.0)
 
     # ---- TTS (optional: disabled without the model installed) ---------
     tts_enabled: bool = True

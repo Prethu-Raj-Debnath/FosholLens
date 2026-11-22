@@ -1,4 +1,4 @@
-"""Tests for the 9-class BARI/BRRI RAG corpus, retriever, and grounded pipeline."""
+"""Tests for the 8-class BARI/BRRI RAG corpus, retriever, and grounded pipeline."""
 
 from __future__ import annotations
 
@@ -61,10 +61,10 @@ def _wait(client: TestClient, analysis_id: str, timeout: float = 20.0) -> dict:
     raise AssertionError("analysis did not finish")
 
 
-def test_corpus_covers_all_9_classes_with_required_schema() -> None:
+def test_corpus_covers_all_8_classes_with_required_schema() -> None:
     corpus = json.loads(CORPUS_PATH.read_text(encoding="utf-8"))
     assert isinstance(corpus, list)
-    assert len(corpus) >= 9
+    assert len(corpus) >= 8
 
     disease_ids = {chunk["disease_id"] for chunk in corpus}
     assert disease_ids == set(EFFICIENTNET["labels"])
@@ -107,10 +107,9 @@ def test_precomputed_index_matches_corpus_chunks() -> None:
         ("rice_bacterial_leaf_blight", "rice", True, True),
         ("rice_tungro", "rice", True, True),
         ("rice_healthy", "rice", True, False),
-        ("rice_other", "rice", True, True),
     ],
 )
-def test_retrieve_grounding_for_all_9_classes(
+def test_retrieve_grounding_for_all_8_classes(
     monkeypatch: pytest.MonkeyPatch,
     disease_id: str,
     crop_id: str,
@@ -160,21 +159,13 @@ def test_blb_and_tungro_explicitly_forbid_fungicides() -> None:
     assert "saao" in tungro_en
 
 
-def test_healthy_and_other_safety_protocols() -> None:
+def test_healthy_safety_protocols() -> None:
     for healthy_id, crop in (("potato_healthy", "potato"), ("rice_healthy", "rice")):
         bundle = rag.retrieve_grounding_bundle(healthy_id, crop)
         assert bundle.cultural_only is True
         assert bundle.refer_to_officer is False
         assert bundle.chemicals == []
         assert "no fungicide" in " ".join(c["content_en"] for c in bundle.chunks).lower()
-
-    other = rag.retrieve_grounding_bundle("rice_other", "rice")
-    assert other.cultural_only is True
-    assert other.refer_to_officer is True
-    assert other.chemicals == []
-    other_en = " ".join(c["content_en"] for c in other.chunks).lower()
-    assert "do not spray" in other_en
-    assert "saao" in other_en
 
 
 def test_aliases_resolve_in_rag_and_knowledge_base() -> None:
@@ -189,7 +180,6 @@ def test_aliases_resolve_in_rag_and_knowledge_base() -> None:
     assert blb_from_alias is blb_from_legacy
     assert blb_from_alias["chemical"] == []
 
-    assert knowledge_base.get_disease("rice_other") is not None
     assert knowledge_base.get_disease("rice_tungro") is not None
     assert knowledge_base.get_disease("rice_brown_spot") is not None
     assert knowledge_base.get_disease("rice_healthy") is not None
@@ -312,7 +302,6 @@ async def test_gemini_writer_receives_rag_passages_and_blocks_cultural_only_chem
         ),
         ("rice_tungro", "rice", "identified", "rice_tungro", False, True, False),
         ("potato_healthy", "potato", "identified", "potato_healthy", False, False, False),
-        ("rice_other", "rice", "undetermined", None, True, True, False),
     ],
 )
 def test_pipeline_surfaces_rag_fields_in_api_result(

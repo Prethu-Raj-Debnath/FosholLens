@@ -21,9 +21,9 @@ Smallholder rice (*ধান*) and potato (*আলু*) farmers in Bangladesh fa
 
 ### Solution
 **FosholLens (ফসল লেন্স)** is a mobile-first Bangla web app and PWA that runs an end-to-end grounded crop advisory pipeline:
-1. **ONNX Leaf Disease Vision** (CPU-only, selectable local 9-class EfficientNet-B0 or Hugging Face ViT-tiny) paired with a leaf-framing capture guide, explicitly flagging uncertain or out-of-scope symptoms (`rice_other`) rather than fabricating diagnoses.
+1. **ONNX Leaf Disease Vision** (CPU-only, local 8-class EfficientNet-B0) paired with a leaf-framing capture guide, explicitly flagging uncertain photos rather than fabricating diagnoses.
 2. **Optional Bangla Voice & Text Question Input** allowing farmers to record a 12-second Bangla voice question or type a question alongside their photo, transcribed natively via Google Gemini Flash audio understanding.
-3. **BARI/BRRI Grounded RAG Prescription Engine** (`18` curated chunks across all 9 leaf classes with precomputed Gemini embeddings + offline TF-IDF fallback), enforcing cultural-only guards for bacterial/viral diseases, no-spray healthy guidance, pre-harvest intervals (PHI), PPE reminders, and SAAO referrals.
+3. **BARI/BRRI Grounded RAG Prescription Engine** (`16` curated chunks across all 8 leaf classes with precomputed Gemini embeddings + offline TF-IDF fallback), enforcing cultural-only guards for bacterial/viral diseases, no-spray healthy guidance, pre-harvest intervals (PHI), PPE reminders, and SAAO referrals.
 4. **48-Hour Color-Coded Spray Timeline & GPS Auto-District** using Open-Meteo hourly forecasts across all 64 districts of Bangladesh (with one-tap Haversine GPS district matching), deterministically computing safe (`green`), caution (`amber`), and wash-off/drift risk (`red`) hours plus a pure-Bangla safest daylight spray window.
 5. **Bangla Advisory Synthesis & Local Voice Playback** via Google Gemini Flash (with deterministic `TemplateWriter` fallback) and local ONNX Bangla TTS (`sulabhkatiyar/indic-tiny-tts-bengali` + `ffmpeg` -> Opus).
 
@@ -38,16 +38,14 @@ The backend runs a 4-stage asynchronous job pipeline (`reading -> grounding -> w
    - Server-side preprocessing downscales photos to `1280px` max edge and re-encodes to JPEG, stripping EXIF metadata so phone GPS coordinates are never stored on disk.
    - Scope is **rice (`rice`) and potato (`potato`)** only—matching the crops the shipped EfficientNet checkpoint can name (`POST /api/v1/analyses` rejects other crops with `400 unsupported_crop`).
 2. **Stage 1 — Vision & Voice Understanding (`apps/api/app/vision/`, `apps/api/app/llm/audio_input.py`):**
-   - **Vision (`VISION_MODEL`):** Runs local CPU ONNX inference (`onnxruntime`):
-     - `efficientnet` *(the shipped default model, committed at `apps/api/models/foshollens_leaf.onnx`, 16 MB, ~40 ms)*: EfficientNet-B0 across all 9 rice & potato classes (`potato_early_blight`, `potato_healthy`, `potato_late_blight`, `rice_bacterial_leaf_blight`, `rice_blast`, `rice_brown_spot`, `rice_healthy`, `rice_other`, and `rice_tungro`). Every disease and healthy label is surfaced to the farmer (`is_healthy` routes healthy plants to no-spray care); only `rice_other` stays non-diagnostic.
-     - `vit` *(deprecated; opt in via `VISION_MODEL=vit`, `wambugu71/crop_leaf_diseases_vit_onnx`, 22 MB)*: ViT-tiny across 13 corn/potato/rice/wheat classes (its corn and wheat classes remain unsupported).
-     - Threshold (`VISION_CONFIDENCE_THRESHOLD=0.55`) is checked on raw softmax probabilities before crop filtering.
+   - **Vision:** Runs local CPU ONNX inference (`onnxruntime`):
+     - EfficientNet-B0 *(committed at `apps/api/models/foshollens_leaf.onnx`, 16 MB, ~40 ms)*: 8 rice & potato classes (`potato_early_blight`, `potato_healthy`, `potato_late_blight`, `rice_bacterial_leaf_blight`, `rice_blast`, `rice_brown_spot`, `rice_healthy`, and `rice_tungro`). Every label is surfaced to the farmer (`is_healthy` routes healthy plants to no-spray care).
+     - Threshold (`VISION_CONFIDENCE_THRESHOLD=0.6`) is checked on the winning class's raw softmax probability, before crop filtering. A clear winner just below it is still accepted when it beats the runner-up by `VISION_MARGIN=0.30`, clears `VISION_MARGIN_FLOOR=0.45`, and the photo is at least `VISION_MARGIN_MIN_CROP_MASS=0.70` the selected crop.
    - **Optional Bangla Voice/Text Question:** Accepts optional `question_text` (up to `300` chars) and `audio` (up to `5 MB`; `webm`, `ogg`, `mp4`, `mpeg`, `wav` with codec suffix stripping). `transcribe_bangla_question()` sends audio bytes natively to Gemini Flash (`types.Part.from_bytes`) and degrades cleanly to `None` if unconfigured or silent.
 3. **Stage 2 — BARI/BRRI Hybrid RAG & 48-Hour Weather Guard (`apps/api/app/grounding/`):**
-   - **BARI/BRRI Grounded RAG (`rag.py`, `knowledge_base.py`):** Retrieves grounded Bangla/English passages from the 18-chunk corpus (`apps/api/data/bari_brri_corpus.json`) ranked by hybrid cosine similarity over precomputed `gemini-embedding-001` vectors (`apps/api/data/bari_brri_index.json`) and zero-network TF-IDF fallback—prioritizing the farmer's voice/text question when present.
+   - **BARI/BRRI Grounded RAG (`rag.py`, `knowledge_base.py`):** Retrieves grounded Bangla/English passages from the 16-chunk corpus (`apps/api/data/bari_brri_corpus.json`) ranked by hybrid cosine similarity over precomputed `gemini-embedding-001` vectors (`apps/api/data/bari_brri_index.json`) and zero-network TF-IDF fallback—prioritizing the farmer's voice/text question when present.
      - Marks `rice_bacterial_leaf_blight` and `rice_tungro` as `cultural_only=True` & `refer_to_officer=True` (explicitly warning that fungicides do not work).
      - Marks `potato_healthy` & `rice_healthy` as no-spray healthy confirmations.
-     - Marks `rice_other` as uncertain (`refer_to_officer=True`), advising against blind spraying.
    - **48h Weather Spray Timeline (`weather.py`, `districts.py`):** Evaluates Open-Meteo `forecast_days=2` hourly rain probability, precipitation (`mm`), and wind speed (`km/h`):
      - `red` (unsafe): `rainProb >= 60%`, `rainMm >= 1.0`, `windKmh >= 15.0`, or heavy rain (`>= 60%` or `>= 1.0 mm`) within the next 3 hours (wash-off lookahead).
      - `amber` (caution): `rainProb >= 30%`, `rainMm > 0.0`, or `windKmh >= 10.0`.
@@ -65,9 +63,8 @@ The backend runs a 4-stage asynchronous job pipeline (`reading -> grounding -> w
 - **Frontend (`apps/frontend`):** React 19, TypeScript, Vite 7, React Router, Lucide icons, PWA manifest, Noto Sans Bengali, Browser `MediaRecorder` & Geolocation APIs
 - **Shared Contracts (`packages/contracts`):** Pydantic v2 models (`apps/api/app/contracts.py`) mirrored in TypeScript/Zod (`@foshol-lens/contracts`)
 - **Backend (`apps/api`):** Python 3.12+, FastAPI, Uvicorn, Pydantic v2, `aiosqlite` (SQLite WAL), HTTPX, Pillow, NumPy, `onnxruntime`, `huggingface-hub`
-- **Vision Models:**
-  - Shipped EfficientNet-B0 ONNX checkpoint (`apps/api/models/foshollens_leaf.onnx`, 9 rice & potato classes) — default model
-  - Deprecated opt-in fallback: Hugging Face Vision Transformer [`wambugu71/crop_leaf_diseases_vit`](https://huggingface.co/wambugu71/crop_leaf_diseases_vit) (`wambugu71/crop_leaf_diseases_vit_onnx`, 13 classes)
+- **Vision Model:**
+  - Shipped EfficientNet-B0 ONNX checkpoint (`apps/api/models/foshollens_leaf.onnx`, 8 rice & potato classes)
 - **Embeddings & LLM / Audio AI:** Google Gemini (`google-genai` SDK) — `gemini-embedding-001` for precomputed RAG embeddings and `gemini-3.8-flash` (with fallback chain) for Bangla voice transcription and advisory generation
 - **Text-to-Speech:** [`sulabhkatiyar/indic-tiny-tts-bengali`](https://huggingface.co/sulabhkatiyar/indic-tiny-tts-bengali) (local ONNX, CPU) + `ffmpeg` -> Opus/MP3
 - **Weather API:** [Open-Meteo Forecast API](https://open-meteo.com/) (key-free, non-commercial use)
@@ -89,7 +86,6 @@ In accordance with **CoU AI Hackathon 2026 Rule 10**, Team Tesseract discloses t
 
 ## Third-Party Code & Assets Credits
 
-- [`wambugu71/crop_leaf_diseases_vit`](https://huggingface.co/wambugu71/crop_leaf_diseases_vit) & `wambugu71/crop_leaf_diseases_vit_onnx` — Pretrained Vision Transformer leaf classifier
 - [`sulabhkatiyar/indic-tiny-tts-bengali`](https://huggingface.co/sulabhkatiyar/indic-tiny-tts-bengali) — Local ONNX Bangla neural text-to-speech synthesis
 - [FastAPI](https://fastapi.tiangolo.com/), [Pydantic](https://docs.pydantic.dev/), [NumPy](https://numpy.org/), and [ONNX Runtime](https://onnxruntime.ai/) — Backend framework, schema validation, vector math, and CPU inference
 - [React](https://react.dev/), [Vite](https://vite.dev/), [React Router](https://reactrouter.com/), [Zod](https://zod.dev/), and [Lucide](https://lucide.dev/) — Frontend UI, routing, and contract validation
@@ -115,7 +111,7 @@ foshollens/
 │   │   │   ├── config.py              # Environment settings (.env & apps/api/.env)
 │   │   │   ├── store.py               # SQLite (WAL) persistence
 │   │   │   ├── jobs/pipeline.py       # In-process 4-stage async job runner
-│   │   │   ├── vision/                # ONNX leaf classifier (EfficientNet-B0 / ViT)
+│   │   │   ├── vision/                # ONNX leaf classifier (EfficientNet-B0)
 │   │   │   ├── grounding/
 │   │   │   │   ├── rag.py             # Hybrid vector + offline TF-IDF BARI/BRRI retriever
 │   │   │   │   ├── knowledge_base.py  # Curated crop/disease KB & aliases
@@ -126,10 +122,10 @@ foshollens/
 │   │   │   │   └── audio_input.py     # Gemini Flash native Bangla audio question transcription
 │   │   │   └── tts/engine.py          # indic-tiny-tts-bengali ONNX + ffmpeg Opus encoder
 │   │   ├── data/
-│   │   │   ├── bari_brri_corpus.json  # 18-chunk curated 9-class BARI/BRRI/DAE knowledge corpus
+│   │   │   ├── bari_brri_corpus.json  # 16-chunk curated 8-class BARI/BRRI/DAE knowledge corpus
 │   │   │   └── bari_brri_index.json   # Precomputed 768-dim Gemini embeddings
 │   │   ├── models/
-│   │   │   └── foshollens_leaf.onnx   # Committed 9-class EfficientNet-B0 ONNX checkpoint (16 MB)
+│   │   │   └── foshollens_leaf.onnx   # Committed 8-class EfficientNet-B0 ONNX checkpoint (16 MB)
 │   │   ├── scripts/
 │   │   │   └── build_rag_index.py     # Rebuilds bari_brri_index.json via gemini-embedding-001
 │   │   └── tests/                     # 142+ pytest tests (API, RAG, voice, weather, vision, TTS, CORS)

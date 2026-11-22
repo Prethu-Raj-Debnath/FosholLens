@@ -1,19 +1,16 @@
 """Leaf disease classification.
 
-Two interchangeable checkpoints, chosen with `VISION_MODEL`:
+One checkpoint: EfficientNet-B0, 8 classes, rice and potato only, loaded from
+`VISION_MODEL_DIR` (16 MB, no download). It runs through `onnxruntime`, which
+is already a dependency here (it powers the TTS engine), so it adds no install
+weight. The PyTorch path the upstream checkpoint ships was not used: it costs a
+~900 MB `torch` wheel for a 16 MB model.
 
-* `vit`          - ViT-tiny, 13 classes, corn/potato/rice/wheat, fetched from
-                   Hugging Face on first use (22 MB).
-* `efficientnet` - EfficientNet-B0, 9 classes, rice/potato only, loaded from
-                   `VISION_MODEL_DIR` (16 MB, no download).
-
-Both run through `onnxruntime`, which is already a dependency here (it powers
-the TTS engine), so neither adds install weight. The PyTorch path the upstream
-checkpoints ship was not used: it costs a ~900 MB `torch` wheel for a 22 MB
-model.
-
-The decision rule below is shared. Only the spec differs, so the two models
-cannot drift apart in *when they refuse* — just in what they can name.
+The decision rule mirrors `predict_final.py`: restrict the answer to the crop
+the farmer selected, choose the best class inside that crop, but judge it on its
+raw (unmasked) probability. The masked/renormalised vector is only used for
+ranking — thresholding it would let a wrong-crop photo clear the bar, because
+renormalisation throws away the evidence that the photo was mostly another crop.
 """
 
 from __future__ import annotations
@@ -24,12 +21,11 @@ from pathlib import Path
 from typing import Any, Literal, TypedDict
 
 from ..config import settings
-from .models import ModelSpec, get_spec
+from .models import EFFICIENTNET, ModelSpec
 
 log = logging.getLogger(__name__)
 
 VisionStatus = Literal["identified", "undetermined", "unavailable"]
-RAW_MIN_CONFIDENCE = 0.35
 
 
 class VisionFacts(TypedDict):
@@ -46,12 +42,12 @@ class VisionFacts(TypedDict):
     #: and it must not be dressed up as a disease downstream.
     is_healthy: bool
     #: Which checkpoint produced this, so a stored result stays interpretable
-    #: after `VISION_MODEL` changes.
+    #: after the checkpoint changes.
     model: str | None
 
 
 class LeafClassifier:
-    """Lazy, serialised ONNX inference for one checkpoint.
+    """Lazy, serialised ONNX inference for the shipped checkpoint.
 
     `onnxruntime` sessions are thread-safe for `run`, but construction is not,
     so loading takes a lock — the same pattern the TTS engine uses for its
@@ -59,7 +55,7 @@ class LeafClassifier:
     """
 
     def __init__(self, spec: ModelSpec | None = None) -> None:
-        self._spec = spec if spec is not None else get_spec(settings.vision_model)
+        self._spec = spec if spec is not None else EFFICIENTNET
         self._session: Any = None
         self._load_lock = asyncio.Lock()
 
@@ -75,11 +71,9 @@ class LeafClassifier:
     def status(self) -> Literal["ready", "unavailable"]:
         """Whether this stage can actually do anything right now.
 
-        Deliberately not a probe of the Hub: a checkpoint with a `hf_repo` is
-        downloaded on first use, so asking `/health` must not reach the network.
-        A *local* spec is different — its bytes either exist or they never will,
-        and reporting `ready` for a file that is not there turns every photo
-        into a silent "could not identify" instead of a startup error.
+        A local checkpoint's bytes either exist or they never will, and
+        reporting `ready` for a file that is not there turns every photo into a
+        silent "could not identify" instead of a startup error.
         """
         if not settings.vision_enabled:
             return "unavailable"
@@ -88,10 +82,15 @@ class LeafClassifier:
         return "unavailable" if missing_weights(self._spec) else "ready"
 
     def _load(self) -> Any:
-        """Open the ONNX graph, downloading the weights if the spec says so."""
+        """Open the ONNX graph from `settings.vision_model_dir`."""
         import onnxruntime as ort
 
-        path = _resolve_weights(self._spec)
+        path = Path(settings.vision_model_dir) / self._spec["file"]
+        if not path.exists():
+            raise FileNotFoundError(
+                f"vision model not found at {path}; put {self._spec['file']} there, "
+                "or set VISION_MODEL_DIR to the directory containing it"
+            )
         session = ort.InferenceSession(
             str(path),
             providers=["CPUExecutionProvider"],
@@ -149,39 +148,13 @@ class LeafClassifier:
         return _decide(_softmax(logits), crop_id, spec)
 
 
-def _resolve_weights(spec: ModelSpec) -> Path:
-    """Find the checkpoint's bytes.
-
-    A spec with a Hub repo is downloaded (and cached) on first use. A spec
-    without one is a team-trained artifact: it must already be on disk, so a
-    missing file raises here naming the path it looked in rather than failing
-    later inside onnxruntime.
-    """
-    if spec["hf_repo"]:
-        from huggingface_hub import hf_hub_download
-
-        return Path(hf_hub_download(spec["hf_repo"], filename=spec["file"]))
-
-    path = Path(settings.vision_model_dir) / spec["file"]
-    if not path.exists():
-        raise FileNotFoundError(
-            f"vision model not found at {path}; put {spec['file']} there, or set "
-            f"VISION_MODEL_DIR to the directory containing it"
-        )
-    return path
-
-
 def missing_weights(spec: ModelSpec) -> Path | None:
     """The local path that is missing, or `None` when this stage can proceed.
 
-    A Hub checkpoint returns `None` unconditionally: whether it is cached is not
-    worth a network call in `/health`, so "not known to be missing" is reported
-    as ready. The first real inference is what fetches it. A local spec is
-    different — the bytes either exist or they never will.
+    The checkpoint is committed to the repo, so a missing file means a broken
+    deployment rather than an optional download. Reporting it from `/health`
+    makes that visible before the first upload.
     """
-    if spec["hf_repo"]:
-        return None
-
     path = Path(settings.vision_model_dir) / spec["file"]
     return None if path.exists() else path
 
@@ -221,13 +194,21 @@ def _softmax(logits: Any) -> Any:
 
 
 def _decide(probabilities: Any, crop_id: str, spec: ModelSpec) -> VisionFacts:
-    """Turn probabilities into facts, logging top-3 and scoping to selected crop.
+    """Turn probabilities into facts, following `predict_final.py`.
 
-    Raw max-class probability is checked first so clear predictions (or high-
-    confidence non-diagnostic/wrong-crop photos) act directly. When softmax mass
-    splits across rice/potato classes on an in-crop photo, we renormalise within
-    the requested crop only if raw top-class confidence still clears
-    `RAW_MIN_CONFIDENCE` (so blurry/non-leaf images stay undetermined).
+    The winning class is chosen within the selected crop (masked and
+    renormalised for ranking only), but its confidence is the raw, unmasked
+    softmax probability — the model's actual evidence for that class.
+
+    Two acceptance paths, so a clear photo is not refused just because it falls
+    short of one number:
+
+    * primary — raw confidence clears `VISION_CONFIDENCE_THRESHOLD`;
+    * margin — raw confidence clears `VISION_MARGIN_FLOOR`, the winner beats the
+      runner-up by `VISION_MARGIN`, and the photo is mostly the selected crop
+      (`VISION_MARGIN_MIN_CROP_MASS`). This is deliberately stricter about
+      ambiguity and crop mass than a flat threshold cut, which on the local test
+      sets mostly accepted confident mistakes rather than rescuing clear photos.
     """
     import numpy as np
 
@@ -236,54 +217,67 @@ def _decide(probabilities: Any, crop_id: str, spec: ModelSpec) -> VisionFacts:
     ranked = np.argsort(probs)[::-1]
     top3 = ", ".join(f"{labels[int(i)]}={float(probs[int(i)]):.3f}" for i in ranked[:3])
 
-    raw_index = int(ranked[0])
-    raw_label = labels[raw_index]
-    raw_conf = float(probs[raw_index])
-
-    crop_indices = [i for i, lbl in enumerate(labels) if spec["label_crop"].get(lbl) == crop_id]
+    crop_indices = [i for i, label in enumerate(labels) if spec["label_crop"].get(label) == crop_id]
     crop_mass = float(sum(float(probs[i]) for i in crop_indices)) if crop_indices else 0.0
-    other_mass = float(sum(float(probs[i]) for i in range(len(labels)) if i not in crop_indices))
-    denom = max(1.0 - other_mass, crop_mass)
 
-    crop_best_label: str | None = None
-    crop_scoped_conf = 0.0
     if crop_indices:
-        crop_best_idx = max(crop_indices, key=lambda i: float(probs[i]))
-        crop_best_label = labels[crop_best_idx]
-        crop_scoped_conf = (float(probs[crop_best_idx]) / denom) if denom > 0.0 else 0.0
+        masked = np.zeros_like(probs)
+        masked[crop_indices] = probs[crop_indices]
+        total = float(masked.sum())
+        masked = masked / total if total > 0.0 else masked
+        order = np.argsort(masked)[::-1]
+        best_index = int(order[0])
+        runner_up_index = int(order[1]) if len(order) > 1 else best_index
+    else:
+        # Out-of-scope crop: still report the model's own top label, but the
+        # acceptance checks below will keep it from becoming a diagnosis.
+        best_index = int(ranked[0])
+        runner_up_index = int(ranked[1]) if len(ranked) > 1 else best_index
+
+    label = labels[best_index]
+    confidence = float(probs[best_index])
+    # Raw gap, not the renormalised one: both numbers must be the model's own
+    # evidence, or a tiny crop mass can manufacture a huge margin.
+    margin = confidence - float(probs[runner_up_index])
 
     log.info(
-        "vision top3 (%s, crop=%s): %s | crop_mass=%.3f crop_top=%s(%.3f)",
+        "vision top3 (%s, crop=%s): %s | crop_mass=%.3f best=%s(%.3f) margin=%.3f",
         spec["id"],
         crop_id,
         top3,
         crop_mass,
-        crop_best_label or "none",
-        crop_scoped_conf,
+        label,
+        confidence,
+        margin,
     )
 
-    threshold = settings.vision_confidence_threshold
-    raw_floor = min(RAW_MIN_CONFIDENCE, threshold)
-
-    if raw_conf >= threshold:
-        return _identify_if_supported(raw_label, raw_conf, crop_id, spec)
+    if confidence >= settings.vision_confidence_threshold:
+        return _identified(label, confidence, crop_id, spec)
 
     if (
-        crop_best_label is not None
-        and raw_conf >= raw_floor
-        and crop_mass >= raw_floor
-        and crop_scoped_conf >= threshold
+        confidence >= settings.vision_margin_floor
+        and margin >= settings.vision_margin
+        and crop_mass >= settings.vision_margin_min_crop_mass
     ):
-        return _identify_if_supported(crop_best_label, crop_scoped_conf, crop_id, spec)
+        log.info(
+            "vision accepted by margin (%s, crop=%s): %s(%.3f) margin=%.3f crop_mass=%.3f",
+            spec["id"],
+            crop_id,
+            label,
+            confidence,
+            margin,
+            crop_mass,
+        )
+        return _identified(label, confidence, crop_id, spec)
 
-    return _undetermined(raw_label, raw_conf, spec)
+    return _undetermined(label, confidence, spec)
 
 
-def _identify_if_supported(
+def _identified(
     label: str, confidence: float, crop_id: str, spec: ModelSpec
 ) -> VisionFacts:
     """Resolve a winning label to a KB diagnosis or fall back to undetermined."""
-    if label in spec["non_diagnostic"] or spec["label_crop"].get(label) != crop_id:
+    if spec["label_crop"].get(label) != crop_id:
         return _undetermined(label, confidence, spec)
     disease_id = spec["label_disease"].get(label)
     if disease_id is None:

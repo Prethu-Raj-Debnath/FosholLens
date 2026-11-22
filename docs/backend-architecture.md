@@ -30,11 +30,11 @@ that wasn't handed to it. That's what keeps a hallucination from telling a
 farmer to spray the wrong chemical.
 
 **Stage 1 reads the photo, but refuses more often than it confirms.**
-`vision/classifier.py` runs a 13-class ViT and maps only three of its labels to
-curated knowledge-base entries. A label with no entry, a healthy leaf, the
-model's own `Invalid` class, a below-threshold probability, or a label belonging
-to a different crop all produce `undetermined`; the pipeline then falls back to a
-per-crop KB entry and marks the result unconfirmed. That fallback is the same
+`vision/classifier.py` runs an 8-class EfficientNet-B0 and maps every label to a
+curated knowledge-base entry. A below-threshold probability, or a label belonging
+to a different crop, produces `undetermined`; the pipeline then falls back to a
+per-crop KB entry and marks the result unconfirmed. A confident in-crop label —
+including `*_healthy` — is surfaced as `identified`. That fallback is the same
 `FALLBACK_DISEASE` lookup as before, now one branch instead of the only branch.
 
 ---
@@ -154,29 +154,20 @@ tapped.
 
 ## 4. Stage 1 — Vision (built, narrow)
 
-`vision/classifier.py` runs one of two ONNX checkpoints, served through
-`onnxruntime` — already a dependency, so neither adds install weight. Which one
-is selected with `VISION_MODEL`; everything else that differs between them lives
-in `vision/models.py` as a spec, so the _decision rule is shared_. They cannot
-drift apart in when they refuse, only in what they can name.
+`vision/classifier.py` runs one ONNX checkpoint, served through `onnxruntime` —
+already a dependency, so it adds no install weight. Everything that differs
+between checkpoints lives in `vision/models.py` as a spec: label order, crop and
+knowledge-base mapping, input size, normalisation and input node name.
 
-| `VISION_MODEL` | Arch                 | Classes | Crops                     | Size  | Latency  | Source          |
-| -------------- | -------------------- | ------- | ------------------------- | ----- | -------- | --------------- |
-| `efficientnet` | EfficientNet-B0      | 9       | rice, potato              | 16 MB | 28–49 ms | local `models/` |
-| `vit`          | ViT-tiny patch16-224 | 13      | corn, potato, rice, wheat | 22 MB | ~140 ms  | Hugging Face    |
+| Arch            | Classes | Crops        | Size  | Latency  | Source          |
+| --------------- | ------- | ------------ | ----- | -------- | --------------- |
+| EfficientNet-B0 | 8       | rice, potato | 16 MB | 28–49 ms | local `models/` |
 
-Measured on this box, CPU only. `efficientnet` is the default: it is faster, and
-it is the only one that can name rice bacterial leaf blight — a disease the
-knowledge base has curated treatment for. `vit` can recognise corn and wheat,
-which the knowledge base has nothing to say about, so that coverage is mostly
-inert; it is kept as an option because a wrong-crop refusal ("that looks like
-corn") is occasionally more useful than "I don't know".
-
-The **default** checkpoint is committed (`apps/api/models/foshollens_leaf.onnx`,
-16 MB), so a fresh clone runs with vision and needs no extra setup. It is the one
-file exempted from the `apps/api/models/` ignore rule; scratch exports and other
-checkpoints still stay out of the repo. The `vit` weights are not committed — 22 MB
-for an optional path — and download on first use.
+Measured on this box, CPU only. The checkpoint is committed
+(`apps/api/models/foshollens_leaf.onnx`, 16 MB), so a fresh clone runs with
+vision and needs no extra setup. It is the one file exempted from the
+`apps/api/models/` ignore rule; scratch exports and other checkpoints stay out of
+the repo.
 
 Two deliberate consequences:
 
@@ -184,55 +175,49 @@ Two deliberate consequences:
   checkpoint that is absent reports `unavailable`; before this it reported `ready`
   and every upload then degraded to "could not identify" with nothing to explain
   why.
-* Startup logs a warning naming the missing path when the configured checkpoint
-  is absent, so the problem is visible in the log rather than discovered one
-  failed upload at a time. A missing file still degrades the stage rather than
-  failing the job: the curated advice behind it is still true.
+* Startup logs a warning naming the missing path when the checkpoint is absent,
+  so the problem is visible in the log rather than discovered one failed upload
+  at a time. A missing file still degrades the stage rather than failing the job:
+  the curated advice behind it is still true.
 
 **Why ONNX and not `transformers`:** the upstream PyTorch path costs a ~900 MB
-`torch` wheel for a 16–22 MB model. The ONNX exports produce the same logits
-from the same weights with no torch at all.
+`torch` wheel for a 16 MB model. The ONNX export produces the same logits from
+the same weights with no torch at all.
 
-**Preprocessing is part of the model contract.** The two checkpoints disagree on
-input size (320 vs 224), normalisation (ImageNet mean/std vs 0.5/0.5) and the
-ONNX input node name (`input` vs `pixel_values`). Getting any of those wrong
-does not raise — it silently degrades accuracy — which is why they live in the
-spec next to the label list rather than as module constants.
+**Preprocessing is part of the model contract.** Input size (320), normalisation
+(ImageNet mean/std) and the ONNX input node name (`input`) are all in the spec.
+Getting any of them wrong does not raise — it silently degrades accuracy — which
+is why they live next to the label list rather than as module constants.
 
-**Threshold placement is the whole safety story.** The model emits one logit per class
-across corn, potato, rice, wheat and an `Invalid` class. The tempting shortcut is
-to filter to the requested crop's classes, renormalise, then threshold. That is
-wrong: a corn leaf asked about as rice still yields a rice class at ~0.75 _after_
-renormalisation, because the renormalisation discards the evidence that the photo
-was mostly corn. `_decide` therefore compares the winning class's **raw,
-unfiltered** softmax probability against the threshold, and only then checks the
-crop and the knowledge-base mapping.
+**Threshold placement is the whole safety story.** `_decide` follows
+`predict_final.py`: it masks to the requested crop and renormalises for ranking
+only, then compares the winning class's **raw, unmasked** softmax probability
+against the threshold. Thresholding the renormalised value would let a
+wrong-crop photo clear the bar, because renormalisation discards the evidence
+that the photo was mostly another crop.
 
-Refusal is the default. `undetermined` is returned for any of:
+A second acceptance path handles the "clear photo, just under one number" case:
+a winner below `VISION_CONFIDENCE_THRESHOLD` is still accepted when it beats the
+runner-up by `VISION_MARGIN`, clears `VISION_MARGIN_FLOOR`, and the photo is at
+least `VISION_MARGIN_MIN_CROP_MASS` the selected crop. On the local test sets a
+flat threshold cut mostly admitted confident mistakes, while this strict margin
+rule rescued a correct answer without adding wrong ones.
+
+`undetermined` is returned for any of:
 
 | Condition                      | Why                                                  |
 | ------------------------------ | ---------------------------------------------------- |
-| probability < 0.55             | not enough evidence                                  |
-| label is `Invalid`             | the model's own "I cannot place this" class          |
-| label is `*_Healthy`           | a healthy leaf is not a disease                      |
+| raw probability < 0.6          | not enough evidence                                  |
 | label's crop ≠ requested crop  | wrong photo, or a crop this model cannot name        |
 | label has no KB entry          | no curated dose exists; inventing one is the failure |
 | model unavailable / unreadable | no evidence at all                                   |
 
-Resolvable labels, per checkpoint:
-
-| Disease               | `efficientnet` | `vit` |
-| --------------------- | -------------- | ----- |
-| rice leaf blast       | yes            | yes   |
-| rice bacterial blight | **yes**        | no    |
-| potato early blight   | yes            | yes   |
-| potato late blight    | yes            | yes   |
-
-Everything else — including a correctly-named rice brown spot or tungro — falls
-back to the per-crop curated entry and is marked unconfirmed. The `efficientnet`
-checkpoint spells its class `rice_bacterial_leaf_blight` while the KB id is
-`rice_bacterial_blight`; the mapping is explicit rather than string surgery, and
-a test asserts every mapped id exists in the knowledge base.
+Every class the checkpoint emits has a curated KB entry: four rice diseases,
+two potato diseases, and the two `*_healthy` classes. A confident `*_healthy`
+label is a real answer, not a refusal: it routes to a no-spray care entry. The
+checkpoint spells its bacterial-blight class `rice_bacterial_leaf_blight` while
+the KB id is `rice_bacterial_blight`; the mapping is explicit rather than string
+surgery, and a test asserts every mapped id exists in the knowledge base.
 
 **What the unconfirmed path does and does not do.** It keeps the crop's organic
 care steps and its source, and it withholds every chemical dose, because a dose
@@ -242,9 +227,9 @@ that case, so it cannot phrase one either. The result carries
 shown is the fallback entry and no number is attached to it.
 
 **The remaining problem is still domain shift.** PlantVillage is studio photos on
-a uniform background; farmers shoot a whole plant in shade. On the nine stock
-photos tested here the model returned `Invalid` or a wrong-crop answer for all
-but two. Mitigations, in order of value:
+a uniform background; farmers shoot a whole plant in shade. On the stock photos
+tested here the model missed most field-style photos. Mitigations, in order of
+value:
 
 1. Collect 50–100 real field photos from the target crops and measure before
    trusting anything. Budget for this; it's the actual work.
@@ -253,16 +238,6 @@ but two. Mitigations, in order of value:
 3. The refusal threshold above is in place; tune `VISION_CONFIDENCE_THRESHOLD`
    once field data exists.
 4. Reject-then-ask: if the top-2 are within 0.05, also refuse.
-
-Two known defects inherited from the upstream model, worth recording because
-they look like bugs here:
-
-- The model card's confusion matrix shows **15** classes (it includes
-  `Corn__Leaf_Blight` and `Rice__Hispa`); the shipped `config.json` and ONNX graph
-  have **13**. That chart is from a different training run.
-- Rice support in that matrix is small (86 / 65 / 191 images for brown spot,
-  healthy, blast), so rice predictions are the least trustworthy part of an
-  already-narrow model.
 
 **The real problem is not the model, it's the domain shift.** PlantVillage is
 studio photos on a uniform background. Farmers shoot a whole plant, in shade,
@@ -710,9 +685,8 @@ LLM_MAX_CONCURRENCY=3                 # provider caps at 3 without a plan
 
 # ---- vision ----
 VISION_ENABLED=true
-VISION_MODEL=efficientnet             # or: vit
 VISION_MODEL_DIR=./models             # default checkpoint is committed here
-VISION_CONFIDENCE_THRESHOLD=0.55      # raw softmax, before any crop filtering
+VISION_CONFIDENCE_THRESHOLD=0.6       # raw softmax, before any crop filtering
 
 # ---- TTS ----
 TTS_ENABLED=true

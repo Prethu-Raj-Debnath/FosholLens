@@ -6,9 +6,9 @@ against them; it never invents one.
 
 Scope is rice and potato only. Those are the two crops the shipped EfficientNet
 checkpoint can actually name, so they are the two crops the app offers. Tomato
-and chili were carried here while the ViT checkpoint was the primary model; they
-have no class in the main checkpoint, so every photo of them could only ever be
-answered with "could not identify". Offering them was a dead end, not a feature.
+and chili have no class in that checkpoint, so every photo of them could only
+ever be answered with "could not identify". Offering them was a dead end, not a
+feature.
 
 Every `chemical` entry carries a Bangla transliteration of the active ingredient
 (`bnName`) as well as the Latin one. That is not cosmetic: the TTS model silently
@@ -294,32 +294,6 @@ HEALTHY: dict[str, DiseaseEntry] = {
     },
 }
 
-#: Catch-all / out-of-scope safety entries, also kept outside `KB` so `crops()`
-#: only enumerates real diseases.
-NON_DIAGNOSTIC: dict[str, DiseaseEntry] = {
-    "rice_other": {
-        "id": "rice_other",
-        "cropId": "rice",
-        "cropName": "ধান",
-        "diseaseLabel": "অন্যান্য বা অচিহ্নিত ধানের লক্ষণ",
-        "bnName": "অন্যান্য লক্ষণ",
-        "symptoms": [
-            "লক্ষণটি ধানের আওতাভুক্ত প্রধান ৪টি রোগের সাথে নিশ্চিতভাবে মেলেনি",
-        ],
-        "organic": [
-            "নিশ্চিত না হয়ে আন্দাজে কোনো ছত্রাকনাশক বা কীটনাশক স্প্রে করবেন না",
-            "দিনের ভালো আলোতে আক্রান্ত পাতার আরও পরিষ্কার কাছের ছবি তুলে আবার চেষ্টা করুন",
-            "সরাসরি স্থানীয় উপ-সহকারী কৃষি কর্মকর্তাকে পাতা দেখিয়ে পরামর্শ নিন",
-        ],
-        "chemical": [],
-        "prevention": [
-            "জমির পানি, মাটি ও পুষ্টি অবস্থা নিয়মিত পর্যবেক্ষণ করুন",
-            "কোনো রাসায়নিক স্প্রে দেওয়ার আগে কৃষি কর্মকর্তার সাথে নিশ্চিত হয়ে নিন",
-        ],
-        "source": "BRRI ও DAE ফসল সুরক্ষা নির্দেশিকা",
-    },
-}
-
 _DISEASES = {entry["id"]: entry for entry in KB}
 _HEALTHY_BY_ID = {entry["id"]: entry for entry in HEALTHY.values()}
 _DISEASE_ALIASES = {
@@ -328,13 +302,9 @@ _DISEASE_ALIASES = {
 
 
 def get_disease(disease_id: str) -> DiseaseEntry | None:
-    """Look up an entry. Healthy, catch-all, and alias entries resolve here too."""
+    """Look up an entry. Healthy and alias entries resolve here too."""
     canonical = _DISEASE_ALIASES.get(disease_id, disease_id)
-    return (
-        _DISEASES.get(canonical)
-        or _HEALTHY_BY_ID.get(canonical)
-        or NON_DIAGNOSTIC.get(canonical)
-    )
+    return _DISEASES.get(canonical) or _HEALTHY_BY_ID.get(canonical)
 
 
 def get_healthy(crop_id: str) -> DiseaseEntry | None:
