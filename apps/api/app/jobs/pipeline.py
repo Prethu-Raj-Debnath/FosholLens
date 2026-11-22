@@ -407,6 +407,10 @@ def _build_facts(
         for passage in grounding.prompt_passages
     ]
 
+    weather_facts = weather.as_prompt_facts() if weather else None
+    if weather_facts is not None and (is_healthy or cultural_only or not confirmed):
+        weather_facts["safest_window_summary_bn"] = None
+
     return {
         "diagnosis": {
             "crop": disease["cropName"],
@@ -422,7 +426,7 @@ def _build_facts(
             "chemical": prompt_chemicals,
         },
         "prevention": disease["prevention"],
-        "weather": weather.as_prompt_facts() if weather else None,
+        "weather": weather_facts,
         "uncertain": not confirmed,
         "farmer_question": farmer_question,
         "rag_grounding": {
@@ -562,6 +566,8 @@ def _build_result(
                 "humidity": weather.humidity,
                 "sprayWindowOk": weather.spray_window_ok,
                 "reason": weather.reason,
+                "hourlyWindows": [w.as_contract_dict() for w in weather.hourly_windows],
+                "safestWindowSummaryBn": weather.safest_window_summary_bn,
             }
             if weather
             else None

@@ -1,0 +1,299 @@
+"""Tests for the 48-hour color-coded spray timeline and safe-window summary."""
+
+from __future__ import annotations
+
+import io
+import re
+import time
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+import pytest
+from fastapi.testclient import TestClient
+from PIL import Image
+
+from app.config import settings
+from app.contracts import AnalysisResult, Weather
+from app.grounding import knowledge_base, rag
+from app.grounding.weather import classify
+from app.jobs import pipeline
+from app.llm.writer import TemplateWriter, reset_writer
+from app.main import app
+from app.vision import VisionFacts
+
+_DHAKA_TZ = timezone(timedelta(hours=6))
+_LATIN_RE = re.compile(r"[A-Za-z]")
+
+
+def _make_48h_payload(
+    *,
+    start: datetime | None = None,
+    rain_prob: list[int] | None = None,
+    rain_mm: list[float] | None = None,
+    wind: list[float] | None = None,
+    humidity: list[int] | None = None,
+) -> dict:
+    start_dt = start or datetime(2026, 11, 22, 6, 0, tzinfo=_DHAKA_TZ)
+    times = [(start_dt + timedelta(hours=i)).isoformat(timespec="minutes") for i in range(48)]
+    return {
+        "hourly": {
+            "time": times,
+            "precipitation_probability": rain_prob if rain_prob is not None else [10] * 48,
+            "precipitation": rain_mm if rain_mm is not None else [0.0] * 48,
+            "wind_speed_10m": wind if wind is not None else [5.0] * 48,
+            "relative_humidity_2m": humidity if humidity is not None else [70] * 48,
+        }
+    }
+
+
+def _jpeg() -> bytes:
+    buffer = io.BytesIO()
+    Image.new("RGB", (64, 64), (40, 120, 60)).save(buffer, format="JPEG")
+    return buffer.getvalue()
+
+
+def _wait(client: TestClient, analysis_id: str, timeout: float = 20.0) -> dict:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        summary = client.get(f"/api/v1/analyses/{analysis_id}").json()
+        if summary["status"] in {"completed", "failed"}:
+            return summary
+        time.sleep(0.1)
+    raise AssertionError("analysis did not finish")
+
+
+def test_classify_produces_48_windows_validating_contract() -> None:
+    facts = classify(_make_48h_payload(), "dhaka", "ঢাকা")
+    assert len(facts.hourly_windows) == 48
+    assert all(w.safety == "green" for w in facts.hourly_windows)
+    assert facts.safest_window_summary_bn
+    assert not _LATIN_RE.search(facts.safest_window_summary_bn)
+
+    contract = Weather(
+        district=facts.district_name,
+        rainProbabilityNext12h=facts.rain_probability,
+        windSpeedMax12h=facts.wind_speed_max,
+        humidity=facts.humidity,
+        sprayWindowOk=facts.spray_window_ok,
+        reason=facts.reason,
+        hourlyWindows=[w.as_contract_dict() for w in facts.hourly_windows],
+        safestWindowSummaryBn=facts.safest_window_summary_bn,
+    )
+    assert len(contract.hourlyWindows) == 48
+
+
+def test_deterministic_green_amber_red_thresholds() -> None:
+    probs = [10] * 48
+    mms = [0.0] * 48
+    winds = [5.0] * 48
+
+    # Isolated amber triggers well apart from any rain red hours.
+    probs[10] = 30
+    mms[16] = 0.2
+    winds[22] = 10.0
+
+    # Isolated high wind triggers red without wash-off lookahead bleeding backward.
+    winds[30] = 15.0
+
+    facts = classify(
+        _make_48h_payload(rain_prob=probs, rain_mm=mms, wind=winds),
+        "bogura",
+        "বগুড়া",
+    )
+    windows = facts.hourly_windows
+
+    assert windows[0].safety == "green"
+    assert windows[10].safety == "amber"
+    assert windows[16].safety == "amber"
+    assert windows[22].safety == "amber"
+    assert windows[29].safety == "green"  # wind does NOT trigger wash-off lookahead
+    assert windows[30].safety == "red"
+
+
+def test_three_hour_washoff_lookahead_marks_prior_hours_red() -> None:
+    probs = [5] * 48
+    mms = [0.0] * 48
+
+    # Heavy rain at hour 10 (prob >= 60) and hour 25 (mm >= 1.0).
+    probs[10] = 65
+    mms[25] = 1.2
+
+    facts = classify(_make_48h_payload(rain_prob=probs, rain_mm=mms), "sylhet", "সিলেট")
+    windows = facts.hourly_windows
+
+    # Hour 6 is 4h before rain at hour 10 -> stays green.
+    assert windows[6].safety == "green"
+    # Hours 7, 8, 9 are within 3h before hour 10 -> marked red due to wash-off risk.
+    assert windows[7].safety == "red"
+    assert windows[8].safety == "red"
+    assert windows[9].safety == "red"
+    assert windows[10].safety == "red"
+
+    # Hour 21 is 4h before rain_mm=1.2 at hour 25 -> green; 22..24 -> red.
+    assert windows[21].safety == "green"
+    assert windows[22].safety == "red"
+    assert windows[23].safety == "red"
+    assert windows[24].safety == "red"
+    assert windows[25].safety == "red"
+
+
+def test_safest_window_prefers_daylight_block_and_contains_no_latin() -> None:
+    # Start at 00:00: make 00:00-05:59 green (night), 06:00-14:59 rainy (red),
+    # and 15:00-20:59 dry so 15:00-17:59 (hours 15, 16, 17) are genuinely green
+    # (18:00-20:59 are within 3h of 21:00 rain, so lookahead marks 18..20 red).
+    start = datetime(2026, 11, 22, 0, 0, tzinfo=_DHAKA_TZ)
+    probs = [80] * 48
+    for h in range(0, 6):
+        probs[h] = 5
+    for h in range(15, 21):
+        probs[h] = 10
+
+    facts = classify(_make_48h_payload(start=start, rain_prob=probs), "dhaka", "ঢাকা")
+    summary = facts.safest_window_summary_bn
+    assert summary is not None
+    assert not _LATIN_RE.search(summary)
+    assert "আজ" in summary
+    assert "বিকেল ৩টা থেকে ৬টা" in summary
+
+    # When today is all rainy and tomorrow 06:00-09:59 (indices 30..33) are green
+    # (with 34..36 dry buffer before rain resumes at 37):
+    probs_tomorrow = [80] * 48
+    for h in range(30, 37):
+        probs_tomorrow[h] = 10
+    facts_tomorrow = classify(
+        _make_48h_payload(start=start, rain_prob=probs_tomorrow), "dhaka", "ঢাকা"
+    )
+    assert facts_tomorrow.safest_window_summary_bn is not None
+    assert not _LATIN_RE.search(facts_tomorrow.safest_window_summary_bn)
+    assert "আগামীকাল সকাল ৬টা থেকে ১০টা" in facts_tomorrow.safest_window_summary_bn
+
+    # When no daylight green exists across 48h, returns pure Bangla wait note:
+    facts_none = classify(_make_48h_payload(start=start, rain_prob=[80] * 48), "dhaka", "ঢাকা")
+    assert facts_none.safest_window_summary_bn is not None
+    assert not _LATIN_RE.search(facts_none.safest_window_summary_bn)
+    assert "নিরাপদ স্প্রে সময় নেই" in facts_none.safest_window_summary_bn
+
+
+def test_pipeline_passes_safest_window_only_when_spraying_is_applicable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    start = datetime(2026, 11, 22, 6, 0, tzinfo=_DHAKA_TZ)
+    # First 12h rainy (blocks sprayWindowOk), tomorrow 06:00-09:59 (indices 24..27) green.
+    probs = [85] * 48
+    for idx in range(24, 28):
+        probs[idx] = 5
+    weather_facts = classify(_make_48h_payload(start=start, rain_prob=probs), "dhaka", "ঢাকা")
+    assert weather_facts.spray_window_ok is False
+    assert weather_facts.safest_window_summary_bn
+
+    # Check _build_facts gating directly:
+    blast = knowledge_base.get_disease("rice_blast")
+    blb = knowledge_base.get_disease("rice_bacterial_blight")
+    healthy = knowledge_base.get_disease("potato_healthy")
+    assert blast and blb and healthy
+
+    blast_bundle = rag.retrieve_grounding_bundle("rice_blast", "rice")
+    blb_bundle = rag.retrieve_grounding_bundle("rice_bacterial_leaf_blight", "rice")
+    healthy_bundle = rag.retrieve_grounding_bundle("potato_healthy", "potato")
+
+    blast_facts = pipeline._build_facts(
+        blast,
+        weather_facts,
+        VisionFacts(
+            status="identified",
+            label="rice_blast",
+            confidence=0.9,
+            crop_id="rice",
+            disease_id="rice_blast",
+            model="efficientnet",
+        ),
+        confirmed=True,
+        grounding=blast_bundle,
+    )
+    assert (
+        blast_facts["weather"]["safest_window_summary_bn"]
+        == weather_facts.safest_window_summary_bn
+    )
+
+    blb_facts = pipeline._build_facts(
+        blb,
+        weather_facts,
+        VisionFacts(
+            status="identified",
+            label="rice_bacterial_leaf_blight",
+            confidence=0.9,
+            crop_id="rice",
+            disease_id="rice_bacterial_blight",
+            model="efficientnet",
+        ),
+        confirmed=True,
+        grounding=blb_bundle,
+    )
+    assert blb_facts["weather"]["safest_window_summary_bn"] is None
+
+    healthy_facts = pipeline._build_facts(
+        healthy,
+        weather_facts,
+        VisionFacts(
+            status="undetermined",
+            label="potato_healthy",
+            confidence=0.9,
+            crop_id="potato",
+            disease_id=None,
+            model="efficientnet",
+        ),
+        confirmed=True,
+        grounding=healthy_bundle,
+    )
+    assert healthy_facts["weather"]["safest_window_summary_bn"] is None
+
+    # End-to-end API test for rice_blast surfaces 48h timeline & safest window in narrative.
+    storage = tmp_path / "storage"
+    monkeypatch.setattr(settings, "database_path", storage / "test.db")
+    monkeypatch.setattr(settings, "storage_dir", storage)
+    monkeypatch.setattr(settings, "tts_enabled", False)
+    monkeypatch.setattr(settings, "vision_enabled", True)
+    monkeypatch.setattr(settings, "gemini_api_key", "")
+    monkeypatch.setattr(settings, "llm_api_key", "")
+    reset_writer()
+    for directory in (settings.images_dir, settings.audio_dir):
+        directory.mkdir(parents=True, exist_ok=True)
+
+    async def fake_classify(self, _path, _crop):
+        return VisionFacts(
+            status="identified",
+            label="rice_blast",
+            confidence=0.9,
+            crop_id="rice",
+            disease_id="rice_blast",
+            model="efficientnet",
+        )
+
+    async def fake_weather(**_kwargs):
+        return weather_facts
+
+    monkeypatch.setattr(
+        pipeline.get_classifier().__class__, "classify", fake_classify, raising=False
+    )
+    monkeypatch.setattr("app.jobs.pipeline.fetch_weather", fake_weather)
+
+    with TestClient(app) as client:
+        created = client.post(
+            "/api/v1/analyses",
+            files={"image": ("crop.jpg", _jpeg(), "image/jpeg")},
+            data={"crop": "rice", "district": "dhaka"},
+        )
+        assert created.status_code == 202
+        analysis_id = created.json()["id"]
+        _wait(client, analysis_id)
+
+        payload = client.get(f"/api/v1/analyses/{analysis_id}/result").json()
+        result = AnalysisResult.model_validate(payload)
+        assert result.weather is not None
+        assert len(result.weather.hourlyWindows) == 48
+        assert result.weather.safestWindowSummaryBn == weather_facts.safest_window_summary_bn
+        assert weather_facts.safest_window_summary_bn in result.narrative
+
+    # TemplateWriter must never suggest spraying for healthy or cultural_only.
+    healthy_narrative = TemplateWriter().compose(healthy_facts)
+    assert "সবচেয়ে নিরাপদ স্প্রে সময়" not in healthy_narrative

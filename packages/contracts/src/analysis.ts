@@ -81,6 +81,19 @@ export const AnalysisUncertaintySchema = z.object({
 });
 export type AnalysisUncertainty = z.infer<typeof AnalysisUncertaintySchema>;
 
+export const SPRAY_SAFETIES = ['green', 'amber', 'red'] as const;
+export const SpraySafetySchema = z.enum(SPRAY_SAFETIES);
+export type SpraySafety = z.infer<typeof SpraySafetySchema>;
+
+export const HourlySprayWindowSchema = z.object({
+  timeIso: z.string(),
+  rainProb: z.number().int(),
+  rainMm: z.number(),
+  windKmh: z.number(),
+  safety: SpraySafetySchema,
+});
+export type HourlySprayWindow = z.infer<typeof HourlySprayWindowSchema>;
+
 export const WeatherSchema = z.object({
   district: z.string(),
   rainProbabilityNext12h: z.number().int().nullable().optional(),
@@ -89,6 +102,8 @@ export const WeatherSchema = z.object({
   /** Decided in code, never by the language model. */
   sprayWindowOk: z.boolean(),
   reason: z.string(),
+  hourlyWindows: z.array(HourlySprayWindowSchema).default([]),
+  safestWindowSummaryBn: z.string().nullable().optional(),
   source: z.string().optional(),
 });
 export type Weather = z.infer<typeof WeatherSchema>;

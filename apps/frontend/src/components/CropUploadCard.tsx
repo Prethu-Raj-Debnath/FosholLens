@@ -1,11 +1,11 @@
 import type { AnalysisStage } from '@foshol-lens/contracts';
-import { Mic, ScanSearch, Square, Trash2 } from 'lucide-react';
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { LocateFixed, Mic, ScanSearch, Square, Trash2 } from 'lucide-react';
+import { useCallback, useEffect, useId, useRef, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { api, ApiError } from '../lib/api-client';
 import { toBengaliDigits } from '../lib/format';
 import { prepareImage } from '../lib/image';
-import { useDistrict } from '../lib/use-district';
+import { findNearestDistrict, useDistrict } from '../lib/use-district';
 import { AnalysisLoadingState, type UploadPhase } from './AnalysisLoadingState';
 import { ImageDropzone } from './ImageDropzone';
 import { ImagePreview } from './ImagePreview';
@@ -81,6 +81,7 @@ function validateFile(file: File): string | null {
 export function CropUploadCard() {
   const navigate = useNavigate();
   const { district, districts, choose } = useDistrict();
+  const districtSelectId = useId();
 
   const [file, setFile] = useState<File | null>(null);
   const [crop, setCrop] = useState<string>('rice');
@@ -94,6 +95,8 @@ export function CropUploadCard() {
   const [audioBlob, setAudioBlob] = useState<Blob | null>(null);
   const [audioPreviewUrl, setAudioPreviewUrl] = useState<string | null>(null);
   const [micNote, setMicNote] = useState<string | null>(null);
+  const [locating, setLocating] = useState(false);
+  const [gpsNote, setGpsNote] = useState<string | null>(null);
 
   // Object URL for the on-screen preview, revoked on replace/unmount.
   const previewRef = useRef<string | null>(null);
@@ -246,6 +249,43 @@ export function CropUploadCard() {
     }
   }
 
+  function handleLocateDistrict() {
+    if (busy || locating) return;
+    if (districts.length === 0) {
+      setGpsNote('জেলার তালিকা লোড হচ্ছে, অনুগ্রহ করে হাতে নির্বাচন করুন।');
+      return;
+    }
+    if (!navigator.geolocation || typeof navigator.geolocation.getCurrentPosition !== 'function') {
+      setGpsNote('এই ব্রাউজারে অবস্থান নির্ণয় সমর্থিত নয়; হাতে জেলা বেছে নিন।');
+      return;
+    }
+
+    setLocating(true);
+    setGpsNote(null);
+
+    navigator.geolocation.getCurrentPosition(
+      (position) => {
+        setLocating(false);
+        const nearest = findNearestDistrict(
+          position.coords.latitude,
+          position.coords.longitude,
+          districts,
+        );
+        if (nearest) {
+          choose(nearest.id);
+          setGpsNote(`অবস্থান অনুযায়ী নির্বাচিত: ${nearest.name}`);
+        } else {
+          setGpsNote('নিকটস্থ জেলা নির্ণয় করা যায়নি; হাতে নির্বাচন করুন।');
+        }
+      },
+      () => {
+        setLocating(false);
+        setGpsNote('অবস্থান জানার অনুমতি পাওয়া যায়নি; তালিকা থেকে জেলা বেছে নিন।');
+      },
+      { enableHighAccuracy: false, timeout: 8000, maximumAge: 300_000 },
+    );
+  }
+
   async function handleAnalyze() {
     if (!file || submittingRef.current || recording) return;
 
@@ -323,13 +363,31 @@ export function CropUploadCard() {
           </select>
         </label>
 
-        <label className="field">
-          <span className="field__label">জেলা</span>
+        <div className="field">
+          <div className="field__label-row">
+            <label htmlFor={districtSelectId} className="field__label">
+              জেলা
+            </label>
+            <button
+              type="button"
+              className="gps-btn"
+              disabled={busy || locating}
+              onClick={handleLocateDistrict}
+              title="বর্তমান অবস্থান থেকে নিকটতম জেলা বেছে নিন"
+            >
+              <LocateFixed size={13} strokeWidth={2.2} aria-hidden="true" />
+              {locating ? 'খোঁজা হচ্ছে...' : 'আমার অবস্থান (GPS)'}
+            </button>
+          </div>
           <select
+            id={districtSelectId}
             className="field__input"
             value={district}
             disabled={busy}
-            onChange={(event) => choose(event.target.value)}
+            onChange={(event) => {
+              setGpsNote(null);
+              choose(event.target.value);
+            }}
           >
             <option value="">নির্বাচন করুন</option>
             {districts.map((option) => (
@@ -338,8 +396,10 @@ export function CropUploadCard() {
               </option>
             ))}
           </select>
-        </label>
+        </div>
       </div>
+
+      {gpsNote && <p className="gps-note">{gpsNote}</p>}
 
       <div className="question-box">
         <div className="question-box__header">

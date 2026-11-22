@@ -1,8 +1,9 @@
-"""Open-Meteo client and the deterministic spray-window rule.
+"""Open-Meteo client and the deterministic spray-window rules.
 
-The rule is computed here, in code, never by the LLM. A fabricated "it will rain
-tomorrow, spray today" is the worst possible failure for this product, because
-weather is exactly what decides whether a spray is wasted.
+Both the 12h spray verdict and the 48h hourly timeline are computed here in
+code, never by the LLM. A fabricated "it will rain tomorrow, spray today" is the
+worst possible failure for this product, because weather decides whether a
+spray is washed off or wasted.
 """
 
 from __future__ import annotations
@@ -10,7 +11,8 @@ from __future__ import annotations
 import logging
 import time
 from dataclasses import dataclass
-from typing import Any
+from datetime import datetime, timedelta, timezone
+from typing import Any, Literal
 
 import httpx
 
@@ -22,10 +24,40 @@ log = logging.getLogger(__name__)
 RAIN_THRESHOLD_PCT = 60
 #: Wind above this (km/h) makes spraying drift-prone and wasteful.
 WIND_THRESHOLD_KMH = 15.0
-#: Hours ahead considered for the spray verdict.
+#: Hours ahead considered for the immediate spray verdict.
 HORIZON_HOURS = 12
 
+#: 48-hour spray timeline thresholds.
+TIMELINE_HOURS = 48
+RAIN_MM_RED = 1.0
+RAIN_PROB_AMBER = 30
+WIND_AMBER_KMH = 10.0
+WASHOFF_LOOKAHEAD_HOURS = 3
+DAYLIGHT_START_HOUR = 6
+DAYLIGHT_END_HOUR = 18
+
 HUMIDITY_FIELD = "relative_humidity_2m"
+_DHAKA_TZ = timezone(timedelta(hours=6))
+
+SpraySafety = Literal["green", "amber", "red"]
+
+
+@dataclass(frozen=True, slots=True)
+class HourlySprayWindow:
+    time_iso: str
+    rain_prob: int
+    rain_mm: float
+    wind_kmh: float
+    safety: SpraySafety
+
+    def as_contract_dict(self) -> dict[str, Any]:
+        return {
+            "timeIso": self.time_iso,
+            "rainProb": self.rain_prob,
+            "rainMm": round(self.rain_mm, 2),
+            "windKmh": round(self.wind_kmh, 1),
+            "safety": self.safety,
+        }
 
 
 @dataclass(frozen=True, slots=True)
@@ -37,6 +69,8 @@ class WeatherFacts:
     humidity: int
     spray_window_ok: bool
     reason: str
+    hourly_windows: tuple[HourlySprayWindow, ...] = ()
+    safest_window_summary_bn: str | None = None
 
     def as_prompt_facts(self) -> dict[str, Any]:
         """The shape handed to the LLM. Facts only, no instructions."""
@@ -47,6 +81,7 @@ class WeatherFacts:
             "humidity": self.humidity,
             "spray_window_ok": self.spray_window_ok,
             "reason": self.reason,
+            "safest_window_summary_bn": self.safest_window_summary_bn,
         }
 
 
@@ -60,7 +95,7 @@ def _bn(value: int | float) -> str:
 
 
 def _decide(rain: int, wind: float) -> tuple[bool, str]:
-    """The spray verdict.
+    """The 12-hour spray verdict.
 
     Order matters: rain is the more decisive factor, and the reason string is shown
     to a farmer, so it names the binding constraint rather than listing both.
@@ -68,8 +103,166 @@ def _decide(rain: int, wind: float) -> tuple[bool, str]:
     if rain >= RAIN_THRESHOLD_PCT:
         return False, f"আগামী {_bn(HORIZON_HOURS)} ঘণ্টায় বৃষ্টির সম্ভাবনা {_bn(rain)} শতাংশ"
     if wind >= WIND_THRESHOLD_KMH:
-        return False, f"আগামী {_bn(HORIZON_HOURS)} ঘণ্টায় বাতাসের গতি প্রায় {_bn(round(wind))} কিলোমিটার"
+        return (
+            False,
+            f"আগামী {_bn(HORIZON_HOURS)} ঘণ্টায় বাতাসের গতি প্রায় {_bn(round(wind))} কিলোমিটার",
+        )
     return True, f"আগামী {_bn(HORIZON_HOURS)} ঘণ্টায় বৃষ্টি ও বাতাস স্প্রে করার অনুকূল"
+
+
+def _classify_hour(
+    rain_prob: int,
+    rain_mm: float,
+    wind_kmh: float,
+    *,
+    washoff_risk: bool,
+) -> SpraySafety:
+    if (
+        rain_prob >= RAIN_THRESHOLD_PCT
+        or rain_mm >= RAIN_MM_RED
+        or wind_kmh >= WIND_THRESHOLD_KMH
+        or washoff_risk
+    ):
+        return "red"
+    if rain_prob >= RAIN_PROB_AMBER or rain_mm > 0.0 or wind_kmh >= WIND_AMBER_KMH:
+        return "amber"
+    return "green"
+
+
+def _build_timeline(hourly: dict[str, Any]) -> tuple[HourlySprayWindow, ...]:
+    raw_probs: list[Any] = list(hourly.get("precipitation_probability") or [])[:TIMELINE_HOURS]
+    raw_mms: list[Any] = list(hourly.get("precipitation") or [])[:TIMELINE_HOURS]
+    raw_winds: list[Any] = list(hourly.get("wind_speed_10m") or [])[:TIMELINE_HOURS]
+    raw_times: list[Any] = list(hourly.get("time") or [])[:TIMELINE_HOURS]
+
+    count = max(len(raw_probs), len(raw_winds), len(raw_times))
+    count = min(count, TIMELINE_HOURS)
+    if count == 0:
+        return ()
+
+    base_dt = datetime(2026, 1, 1, 6, 0, tzinfo=_DHAKA_TZ)
+    probs: list[int] = []
+    mms: list[float] = []
+    winds: list[float] = []
+    times: list[str] = []
+
+    for idx in range(count):
+        prob_val = raw_probs[idx] if idx < len(raw_probs) and raw_probs[idx] is not None else 0
+        mm_val = raw_mms[idx] if idx < len(raw_mms) and raw_mms[idx] is not None else 0.0
+        wind_val = raw_winds[idx] if idx < len(raw_winds) and raw_winds[idx] is not None else 0.0
+        time_val = (
+            str(raw_times[idx])
+            if idx < len(raw_times) and raw_times[idx] is not None
+            else (base_dt + timedelta(hours=idx)).isoformat(timespec="minutes")
+        )
+        probs.append(int(prob_val))
+        mms.append(float(mm_val))
+        winds.append(float(wind_val))
+        times.append(time_val)
+
+    windows: list[HourlySprayWindow] = []
+    for idx in range(count):
+        lookahead_end = min(count, idx + 1 + WASHOFF_LOOKAHEAD_HOURS)
+        washoff_risk = any(
+            probs[j] >= RAIN_THRESHOLD_PCT or mms[j] >= RAIN_MM_RED
+            for j in range(idx + 1, lookahead_end)
+        )
+        safety = _classify_hour(
+            probs[idx],
+            mms[idx],
+            winds[idx],
+            washoff_risk=washoff_risk,
+        )
+        windows.append(
+            HourlySprayWindow(
+                time_iso=times[idx],
+                rain_prob=probs[idx],
+                rain_mm=round(mms[idx], 2),
+                wind_kmh=round(winds[idx], 1),
+                safety=safety,
+            )
+        )
+    return tuple(windows)
+
+
+def _format_bn_start_hour(hour: int) -> str:
+    if 6 <= hour < 12:
+        return f"সকাল {_bn(hour)}টা"
+    if hour == 12:
+        return "দুপুর ১২টা"
+    if 13 <= hour <= 14:
+        return f"দুপুর {_bn(hour - 12)}টা"
+    if 15 <= hour < 18:
+        return f"বিকেল {_bn(hour - 12)}টা"
+    if hour == 18:
+        return "সন্ধ্যা ৬টা"
+    if hour == 0:
+        return "রাত ১২টা"
+    if 1 <= hour < 6:
+        return f"ভোর {_bn(hour)}টা"
+    return f"রাত {_bn(hour - 12)}টা"
+
+
+def _format_bn_end_hour(hour: int) -> str:
+    if hour <= 12:
+        return f"{_bn(hour)}টা"
+    return f"{_bn(hour - 12)}টা"
+
+
+def _day_label_bn(day_offset: int) -> str:
+    if day_offset <= 0:
+        return "আজ"
+    if day_offset == 1:
+        return "আগামীকাল"
+    return "পরশু"
+
+
+def _compute_safest_window_summary_bn(windows: tuple[HourlySprayWindow, ...]) -> str | None:
+    if not windows:
+        return None
+
+    try:
+        parsed = [(w, datetime.fromisoformat(w.time_iso)) for w in windows]
+    except ValueError:
+        return None
+
+    first_date = parsed[0][1].date()
+
+    blocks: list[list[tuple[int, datetime]]] = []
+    current: list[tuple[int, datetime]] = []
+
+    for w, dt in parsed:
+        is_daylight_green = (
+            w.safety == "green" and DAYLIGHT_START_HOUR <= dt.hour < DAYLIGHT_END_HOUR
+        )
+        if is_daylight_green:
+            day_offset = (dt.date() - first_date).days
+            if current:
+                prev_offset, prev_dt = current[-1]
+                if day_offset == prev_offset and dt.hour == prev_dt.hour + 1:
+                    current.append((day_offset, dt))
+                    continue
+            if current:
+                blocks.append(current)
+            current = [(day_offset, dt)]
+        elif current:
+            blocks.append(current)
+            current = []
+
+    if current:
+        blocks.append(current)
+
+    chosen = next((blk for blk in blocks if len(blk) >= 2), blocks[0] if blocks else None)
+    if not chosen:
+        return "আগামী ৪৮ ঘণ্টায় দিনের বেলায় নিরাপদ স্প্রে সময় নেই; বৃষ্টি ও বাতাস কমার পর স্প্রে করুন"
+
+    day_offset, start_dt = chosen[0]
+    _, end_dt = chosen[-1]
+    end_hour = min(DAYLIGHT_END_HOUR, end_dt.hour + 1)
+    day_bn = _day_label_bn(day_offset)
+    start_bn = _format_bn_start_hour(start_dt.hour)
+    end_bn = _format_bn_end_hour(end_hour)
+    return f"সবচেয়ে নিরাপদ স্প্রে সময়: {day_bn} {start_bn} থেকে {end_bn}"
 
 
 def classify(payload: dict[str, Any], district_id: str, district_name: str) -> WeatherFacts:
@@ -86,6 +279,9 @@ def classify(payload: dict[str, Any], district_id: str, district_name: str) -> W
     humidity = round(sum(humidity_series) / len(humidity_series)) if humidity_series else 0
 
     ok, reason = _decide(rain, wind)
+    windows = _build_timeline(hourly)
+    safest_summary = _compute_safest_window_summary_bn(windows)
+
     return WeatherFacts(
         district_id=district_id,
         district_name=district_name,
@@ -94,6 +290,8 @@ def classify(payload: dict[str, Any], district_id: str, district_name: str) -> W
         humidity=humidity,
         spray_window_ok=ok,
         reason=reason,
+        hourly_windows=windows,
+        safest_window_summary_bn=safest_summary,
     )
 
 
@@ -109,7 +307,7 @@ async def fetch_weather(
     if cached and time.monotonic() - cached[0] < _cache_seconds:
         return cached[1]
 
-    params = {
+    params: dict[str, str | int | float] = {
         "latitude": latitude,
         "longitude": longitude,
         "hourly": f"precipitation_probability,precipitation,wind_speed_10m,{HUMIDITY_FIELD}",

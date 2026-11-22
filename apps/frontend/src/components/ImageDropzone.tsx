@@ -1,4 +1,4 @@
-import { ImagePlus } from 'lucide-react';
+import { ImagePlus, Leaf } from 'lucide-react';
 import { useId, useRef, useState } from 'react';
 
 interface ImageDropzoneProps {
@@ -50,11 +50,24 @@ export function ImageDropzone({ onFile, disabled = false }: ImageDropzoneProps) 
           if (!disabled) handleFiles(event.dataTransfer.files);
         }}
       >
-        <span className="dropzone__icon" aria-hidden="true">
-          <ImagePlus size={24} strokeWidth={1.9} />
+        <span className="dropzone__frame" aria-hidden="true">
+          <span className="dropzone__corner dropzone__corner--tl" />
+          <span className="dropzone__corner dropzone__corner--tr" />
+          <span className="dropzone__corner dropzone__corner--bl" />
+          <span className="dropzone__corner dropzone__corner--br" />
+          <span className="dropzone__icon">
+            <ImagePlus size={22} strokeWidth={1.9} />
+          </span>
+          <span className="dropzone__leaf-hint">
+            <Leaf size={13} strokeWidth={2} />
+            একটি পাতা ফ্রেমের মাঝে রাখুন
+          </span>
         </span>
         <span className="dropzone__label">ছবি নির্বাচন করুন</span>
         <span className="dropzone__helper">ছবি নির্বাচন করুন অথবা এখানে টেনে আনুন</span>
+        <span className="dropzone__tip">
+          ভালো আলোতে একটি আক্রান্ত পাতা ফ্রেমের ভেতরে রেখে ছবি তুলুন
+        </span>
       </button>
     </div>
   );

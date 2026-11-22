@@ -26,6 +26,7 @@ ConfidenceBand = Literal["low", "medium", "high"]
 AudioStatus = Literal["none", "pending", "ready", "failed"]
 GeneratedBy = Literal["llm", "template"]
 CropId = Literal["rice", "potato", "tomato", "chili", "unknown"]
+SpraySafety = Literal["green", "amber", "red"]
 
 
 class Diagnosis(BaseModel):
@@ -62,6 +63,14 @@ class Uncertainty(BaseModel):
     message: str
 
 
+class HourlySprayWindow(BaseModel):
+    timeIso: str
+    rainProb: int
+    rainMm: float
+    windKmh: float
+    safety: SpraySafety
+
+
 class Weather(BaseModel):
     district: str
     #: Rain probability (%) over the next 12 hours.
@@ -72,6 +81,8 @@ class Weather(BaseModel):
     #: Whether spraying now is sensible, decided in code - never by the LLM.
     sprayWindowOk: bool
     reason: str
+    hourlyWindows: list[HourlySprayWindow] = Field(default_factory=list)
+    safestWindowSummaryBn: str | None = None
     source: str = "Open-Meteo"
 
 
