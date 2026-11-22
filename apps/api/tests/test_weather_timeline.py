@@ -205,6 +205,7 @@ def test_pipeline_passes_safest_window_only_when_spraying_is_applicable(
             confidence=0.9,
             crop_id="rice",
             disease_id="rice_blast",
+            is_healthy=False,
             model="efficientnet",
         ),
         confirmed=True,
@@ -224,6 +225,7 @@ def test_pipeline_passes_safest_window_only_when_spraying_is_applicable(
             confidence=0.9,
             crop_id="rice",
             disease_id="rice_bacterial_blight",
+            is_healthy=False,
             model="efficientnet",
         ),
         confirmed=True,
@@ -235,11 +237,12 @@ def test_pipeline_passes_safest_window_only_when_spraying_is_applicable(
         healthy,
         weather_facts,
         VisionFacts(
-            status="undetermined",
+            status="identified",
             label="potato_healthy",
             confidence=0.9,
             crop_id="potato",
-            disease_id=None,
+            disease_id="potato_healthy",
+            is_healthy=True,
             model="efficientnet",
         ),
         confirmed=True,
@@ -266,6 +269,7 @@ def test_pipeline_passes_safest_window_only_when_spraying_is_applicable(
             confidence=0.9,
             crop_id="rice",
             disease_id="rice_blast",
+            is_healthy=False,
             model="efficientnet",
         )
 

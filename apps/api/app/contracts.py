@@ -25,7 +25,7 @@ AnalysisStage = Literal[
 ConfidenceBand = Literal["low", "medium", "high"]
 AudioStatus = Literal["none", "pending", "ready", "failed"]
 GeneratedBy = Literal["llm", "template"]
-CropId = Literal["rice", "potato", "tomato", "chili", "unknown"]
+CropId = Literal["rice", "potato"]
 SpraySafety = Literal["green", "amber", "red"]
 
 

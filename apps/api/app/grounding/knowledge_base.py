@@ -4,6 +4,12 @@ This is the only component allowed to state a fact: a disease name, a symptom, a
 medicine, a dose. The LLM rewrites prose around these entries and is validated
 against them; it never invents one.
 
+Scope is rice and potato only. Those are the two crops the shipped EfficientNet
+checkpoint can actually name, so they are the two crops the app offers. Tomato
+and chili were carried here while the ViT checkpoint was the primary model; they
+have no class in the main checkpoint, so every photo of them could only ever be
+answered with "could not identify". Offering them was a dead end, not a feature.
+
 Every `chemical` entry carries a Bangla transliteration of the active ingredient
 (`bnName`) as well as the Latin one. That is not cosmetic: the TTS model silently
 deletes Latin-script spans, so a Latin-only product name would vanish from the
@@ -41,6 +47,11 @@ class CropEntry(TypedDict):
     id: str
     name: str
     diseases: list[DiseaseEntry]
+
+
+#: The crops this app supports. Anything else is out of scope, and the API
+#: rejects it rather than storing a row it can never give sourced advice for.
+SUPPORTED_CROPS: tuple[str, ...] = ("rice", "potato")
 
 
 KB: list[DiseaseEntry] = [
@@ -163,47 +174,6 @@ KB: list[DiseaseEntry] = [
         ],
         "source": "BRRI - আধুনিক ধানের চাষ",
     },
-    {
-        "id": "rice_healthy",
-        "cropId": "rice",
-        "cropName": "ধান",
-        "diseaseLabel": "সুস্থ ধান পাতা",
-        "bnName": "সুস্থ ধান",
-        "symptoms": [
-            "পাতায় কোনো রোগ বা ক্ষতির দাগ নেই, গাছ স্বাভাবিক ও সবুজ",
-        ],
-        "organic": [
-            "এখন কোনো ধরনের রাসায়নিক বা ছত্রাকনাশক স্প্রে করবেন না",
-            "সপ্তাহে একবার ক্ষেত ঘুরে পর্যবেক্ষণ করুন এবং পরিমিত পানি ও সার বজায় রাখুন",
-        ],
-        "chemical": [],
-        "prevention": [
-            "নিয়মিত জমি পর্যবেক্ষণ করুন ও আইল পরিষ্কার রাখুন",
-            "সুষম মাত্রায় ইউরিয়া, টিএসপি ও পটাশ সার ব্যবহার করুন",
-        ],
-        "source": "BRRI - আধুনিক ধানের চাষ",
-    },
-    {
-        "id": "rice_other",
-        "cropId": "rice",
-        "cropName": "ধান",
-        "diseaseLabel": "অন্যান্য বা অচিহ্নিত ধানের লক্ষণ",
-        "bnName": "অন্যান্য লক্ষণ",
-        "symptoms": [
-            "লক্ষণটি ধানের আওতাভুক্ত প্রধান ৪টি রোগের সাথে নিশ্চিতভাবে মেলেনি",
-        ],
-        "organic": [
-            "নিশ্চিত না হয়ে আন্দাজে কোনো ছত্রাকনাশক বা কীটনাশক স্প্রে করবেন না",
-            "দিনের ভালো আলোতে আক্রান্ত পাতার আরও পরিষ্কার কাছের ছবি তুলে আবার চেষ্টা করুন",
-            "সরাসরি স্থানীয় উপ-সহকারী কৃষি কর্মকর্তাকে পাতা দেখিয়ে পরামর্শ নিন",
-        ],
-        "chemical": [],
-        "prevention": [
-            "জমির পানি, মাটি ও পুষ্টি অবস্থা নিয়মিত পর্যবেক্ষণ করুন",
-            "কোনো রাসায়নিক স্প্রে দেওয়ার আগে কৃষি কর্মকর্তার সাথে নিশ্চিত হয়ে নিন",
-        ],
-        "source": "BRRI ও DAE ফসল সুরক্ষা নির্দেশিকা",
-    },
     # ---------------------------------------------------------------- potato --
     {
         "id": "potato_late_blight",
@@ -277,15 +247,40 @@ KB: list[DiseaseEntry] = [
         ],
         "source": "BARI - কৃষি প্রযুক্তি হাতবই",
     },
-    {
+]
+
+
+#: The checkpoint's `*_healthy` classes. They are a real result — the model
+#: looked and saw no disease — so they get their own entries. They are kept out
+#: of `KB` on purpose: `crops()` lists diseases, and a healthy plant is not one.
+HEALTHY: dict[str, DiseaseEntry] = {
+    "rice": {
+        "id": "rice_healthy",
+        "cropId": "rice",
+        "cropName": "ধান",
+        "diseaseLabel": "সুস্থ ধানের গাছ",
+        "bnName": "সুস্থ",
+        "symptoms": [],
+        "organic": [
+            "এখন কোনো ধরনের রাসায়নিক বা ছত্রাকনাশক স্প্রে করবেন না",
+            "সপ্তাহে একবার ক্ষেত ঘুরে পর্যবেক্ষণ করুন এবং পরিমিত পানি ও সার বজায় রাখুন",
+        ],
+        # No chemical for a healthy plant: naming one would invite a spray
+        # nobody needs, which costs money and puts the farmer at risk.
+        "chemical": [],
+        "prevention": [
+            "নিয়মিত জমি পর্যবেক্ষণ করুন ও আইল পরিষ্কার রাখুন",
+            "সুষম মাত্রায় ইউরিয়া, টিএসপি ও পটাশ সার ব্যবহার করুন",
+        ],
+        "source": "BRRI - আধুনিক ধানের চাষ",
+    },
+    "potato": {
         "id": "potato_healthy",
         "cropId": "potato",
         "cropName": "আলু",
-        "diseaseLabel": "সুস্থ আলু পাতা",
-        "bnName": "সুস্থ আলু",
-        "symptoms": [
-            "পাতায় ধসা বা রোগের কোনো দাগ দেখা যায়নি, গাছ সুস্থ আছে",
-        ],
+        "diseaseLabel": "সুস্থ আলুর গাছ",
+        "bnName": "সুস্থ",
+        "symptoms": [],
         "organic": [
             "এখন কোনো ধরনের ছত্রাকনাশক বা রাসায়নিক স্প্রে করবেন না",
             "নিয়মিত ৩ থেকে ৪ দিন পরপর ক্ষেত ঘুরে দেখুন ও নালার পানি নিষ্কাশন ঠিক রাখুন",
@@ -297,138 +292,53 @@ KB: list[DiseaseEntry] = [
         ],
         "source": "BARI - কৃষি প্রযুক্তি হাতবই",
     },
-    # ---------------------------------------------------------------- tomato --
-    {
-        "id": "tomato_early_blight",
-        "cropId": "tomato",
-        "cropName": "টমেটো",
-        "diseaseLabel": "টমেটোর আগাম ধসা রোগ",
-        "bnName": "আগাম ধসা",
+}
+
+#: Catch-all / out-of-scope safety entries, also kept outside `KB` so `crops()`
+#: only enumerates real diseases.
+NON_DIAGNOSTIC: dict[str, DiseaseEntry] = {
+    "rice_other": {
+        "id": "rice_other",
+        "cropId": "rice",
+        "cropName": "ধান",
+        "diseaseLabel": "অন্যান্য বা অচিহ্নিত ধানের লক্ষণ",
+        "bnName": "অন্যান্য লক্ষণ",
         "symptoms": [
-            "নিচের পাতায় ছোট বাদামি দাগ",
-            "দাগ ধীরে ধীরে বড় হয়ে পাতাকে হলদে করে দেয়",
-            "পাতা ঝরে পড়ে গাছ খালি হয়ে যায়",
+            "লক্ষণটি ধানের আওতাভুক্ত প্রধান ৪টি রোগের সাথে নিশ্চিতভাবে মেলেনি",
         ],
         "organic": [
-            "আক্রান্ত নিচের পাতা সরিয়ে ফেলুন",
-            "গাছের গোড়ায় খড় বিছিয়ে দিন",
-            "পাতায় পানি জমতে দেবেন না",
+            "নিশ্চিত না হয়ে আন্দাজে কোনো ছত্রাকনাশক বা কীটনাশক স্প্রে করবেন না",
+            "দিনের ভালো আলোতে আক্রান্ত পাতার আরও পরিষ্কার কাছের ছবি তুলে আবার চেষ্টা করুন",
+            "সরাসরি স্থানীয় উপ-সহকারী কৃষি কর্মকর্তাকে পাতা দেখিয়ে পরামর্শ নিন",
         ],
-        "chemical": [
-            {
-                "product": "Mancozeb",
-                "bnName": "ম্যানকোজেব",
-                "dose": "প্রতি লিটারে ২ গ্রাম",
-                "note": "১০ দিন পরপর",
-            },
-        ],
+        "chemical": [],
         "prevention": [
-            "গাছের মাঝে যথেষ্ট দূরত্ব রাখুন",
-            "ফসল আবর্তন করুন",
+            "জমির পানি, মাটি ও পুষ্টি অবস্থা নিয়মিত পর্যবেক্ষণ করুন",
+            "কোনো রাসায়নিক স্প্রে দেওয়ার আগে কৃষি কর্মকর্তার সাথে নিশ্চিত হয়ে নিন",
         ],
-        "source": "BARI - টমেটোর রোগ ব্যবস্থাপনা",
+        "source": "BRRI ও DAE ফসল সুরক্ষা নির্দেশিকা",
     },
-    {
-        "id": "tomato_late_blight",
-        "cropId": "tomato",
-        "cropName": "টমেটো",
-        "diseaseLabel": "টমেটোর নাবি ধসা রোগ",
-        "bnName": "নাবি ধসা",
-        "symptoms": [
-            "পাতায় বড় বাদামি দাগ, কিনারা পানিতে ভেজা",
-            "ফলে বাদামি শক্ত দাগ",
-            "সকালে পাতার নিচে সাদা আস্তরণ",
-        ],
-        "organic": [
-            "আক্রান্ত পাতা ও ফল সরিয়ে ফেলুন",
-            "জমিতে বাতাস চলাচল বাড়ান",
-        ],
-        "chemical": [
-            {
-                "product": "Metalaxyl + Mancozeb",
-                "bnName": "মেটালাক্সিল ও ম্যানকোজেব",
-                "dose": "প্রতি লিটারে ২ গ্রাম",
-                "note": "৭ দিন পরপর",
-            },
-        ],
-        "prevention": [
-            "বীজ শোধন করে বপন করুন",
-            "জমিতে পানি জমতে দেবেন না",
-        ],
-        "source": "BARI - টমেটোর রোগ ব্যবস্থাপনা",
-    },
-    # ----------------------------------------------------------------- chili --
-    {
-        "id": "chili_leaf_curl",
-        "cropId": "chili",
-        "cropName": "মরিচ",
-        "diseaseLabel": "মরিচের পাতা কোঁকড়ানো রোগ",
-        "bnName": "পাতা কোঁকড়ানো",
-        "symptoms": [
-            "নতুন পাতা কুঁকড়ে যায় ও ছোট হয়ে যায়",
-            "গাছের বৃদ্ধি থেমে যায়",
-            "ফল কম ধরে ও ফলের আকার ছোট হয়",
-        ],
-        "organic": [
-            "আক্রান্ত গাছ তুলে ফেলুন",
-            "সাদা মাছি নিয়ন্ত্রণে হলুদ আঠালো ফাঁদ ব্যবহার করুন",
-            "আগাছা পরিষ্কার রাখুন",
-        ],
-        "chemical": [
-            {
-                "product": "Imidacloprid",
-                "bnName": "ইমিডাক্লোপ্রিড",
-                "dose": "প্রতি লিটারে ০.৩ মিলি",
-                "note": "সাদা মাছি দমনে ৭ দিন পরপর",
-            },
-        ],
-        "prevention": [
-            "রোগমুক্ত চারা রোপণ করুন",
-            "পাশে অন্য ফসল চাষ করুন",
-            "সাদা মাছি দেখা দিলে সঙ্গে সঙ্গে ব্যবস্থা নিন",
-        ],
-        "source": "BARI - মরিচের রোগ ও পোকা ব্যবস্থাপনা",
-    },
-    {
-        "id": "chili_anthracnose",
-        "cropId": "chili",
-        "cropName": "মরিচ",
-        "diseaseLabel": "মরিচের অ্যানথ্রাকনোজ রোগ",
-        "bnName": "অ্যানথ্রাকনোজ",
-        "symptoms": [
-            "ফলে গোল বাদামি দাগ, মাঝখানে গাঢ় রিং",
-            "দাগ বড় হয়ে ফল পচে যায়",
-            "আক্রান্ত ফল গাছে ঝুলে থাকে",
-        ],
-        "organic": [
-            "আক্রান্ত ফল তুলে ফেলুন",
-            "ফসল আবর্তন করুন",
-        ],
-        "chemical": [
-            {
-                "product": "Carbendazim",
-                "bnName": "কার্বেন্ডাজিম",
-                "dose": "প্রতি লিটারে ১ গ্রাম",
-                "note": "১০ দিন পরপর",
-            },
-        ],
-        "prevention": [
-            "রোগমুক্ত বীজ ব্যবহার করুন",
-            "ফল সংগ্রহের পর জমি পরিষ্কার করুন",
-        ],
-        "source": "BARI - মরিচের রোগ ও পোকা ব্যবস্থাপনা",
-    },
-]
+}
 
 _DISEASES = {entry["id"]: entry for entry in KB}
+_HEALTHY_BY_ID = {entry["id"]: entry for entry in HEALTHY.values()}
 _DISEASE_ALIASES = {
     "rice_bacterial_leaf_blight": "rice_bacterial_blight",
 }
 
 
 def get_disease(disease_id: str) -> DiseaseEntry | None:
+    """Look up an entry. Healthy, catch-all, and alias entries resolve here too."""
     canonical = _DISEASE_ALIASES.get(disease_id, disease_id)
-    return _DISEASES.get(canonical)
+    return (
+        _DISEASES.get(canonical)
+        or _HEALTHY_BY_ID.get(canonical)
+        or NON_DIAGNOSTIC.get(canonical)
+    )
+
+
+def get_healthy(crop_id: str) -> DiseaseEntry | None:
+    return HEALTHY.get(crop_id)
 
 
 def diseases_for_crop(crop_id: str) -> list[DiseaseEntry]:

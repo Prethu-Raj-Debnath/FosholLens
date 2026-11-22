@@ -90,7 +90,7 @@ def test_every_burst_upload_gets_its_own_result(tmp_path, monkeypatch):
     for directory in (settings.images_dir, settings.audio_dir):
         directory.mkdir(parents=True, exist_ok=True)
 
-    crops = ["rice", "potato", "tomato", "chili"]
+    crops = ["rice", "potato"]
 
     with TestClient(app) as client:
         ids = {}
@@ -116,8 +116,6 @@ def test_every_burst_upload_gets_its_own_result(tmp_path, monkeypatch):
             expected = {
                 "rice": "ধান",
                 "potato": "আলু",
-                "tomato": "টমেটো",
-                "chili": "মরিচ",
             }[crop]
             assert summary["cropName"] == expected
             assert result["narrative"], analysis_id

@@ -400,7 +400,7 @@ class TemplateWriter:
         uncertain: bool = facts.get("uncertain", False)
         rag_grounding = facts.get("rag_grounding") or {}
         cultural_only = bool(rag_grounding.get("cultural_only"))
-        is_healthy = bool(rag_grounding.get("is_healthy"))
+        is_healthy = bool(diagnosis.get("healthy")) or bool(rag_grounding.get("is_healthy"))
         refer_to_officer = bool(rag_grounding.get("refer_to_officer"))
         has_question = bool(str(facts.get("farmer_question") or "").strip())
 
@@ -415,13 +415,14 @@ class TemplateWriter:
                 " উপ-সহকারী কৃষি কর্মকর্তাকে দেখান।"
             )
         elif is_healthy:
+            # The model found nothing wrong; never invite an unnecessary spray.
             parts.append(
-                f"আপনার {diagnosis['crop']} গাছের পাতা সুস্থ আছে, এখন কোনো ছত্রাকনাশক বা"
+                f"আপনার {diagnosis['crop']} গাছটি সুস্থ দেখাচ্ছে, কোনো ছত্রাকনাশক বা"
                 " রাসায়নিক স্প্রে করার প্রয়োজন নেই।"
             )
             organic = treatment.get("organic") or []
-            if len(organic) > 1:
-                parts.append(f"{organic[1]}।")
+            if organic:
+                parts.append(f"{organic[0]}।")
             elif facts.get("prevention"):
                 parts.append(f"{facts['prevention'][0]}।")
         elif cultural_only:

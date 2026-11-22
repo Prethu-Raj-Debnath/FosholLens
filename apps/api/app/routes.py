@@ -144,6 +144,12 @@ async def create_analysis(
     if district is not None and get_district(district) is None:
         raise HTTPException(status_code=400, detail="unknown_district")
 
+    # Rice and potato only: those are the crops the shipped model can name, and
+    # the only ones with curated advice. Accepting tomato or chili here would
+    # store a row that can only ever answer "could not identify".
+    if crop not in knowledge_base.SUPPORTED_CROPS:
+        raise HTTPException(status_code=400, detail="unsupported_crop")
+
     cleaned_question = _clean_question_text(question_text)
 
     audio_bytes: bytes | None = None

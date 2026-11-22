@@ -36,10 +36,11 @@ The backend runs a 4-stage asynchronous job pipeline (`reading -> grounding -> w
 1. **Image Prep, Leaf Framing & Privacy (`apps/frontend` & `apps/api/app/routes.py`):**
    - `ImageDropzone.tsx` provides a dashed corner-framed leaf capture guide and Bangla lighting/framing tip.
    - Server-side preprocessing downscales photos to `1280px` max edge and re-encodes to JPEG, stripping EXIF metadata so phone GPS coordinates are never stored on disk.
+   - Scope is **rice (`rice`) and potato (`potato`)** only—matching the crops the shipped EfficientNet checkpoint can name (`POST /api/v1/analyses` rejects other crops with `400 unsupported_crop`).
 2. **Stage 1 — Vision & Voice Understanding (`apps/api/app/vision/`, `apps/api/app/llm/audio_input.py`):**
    - **Vision (`VISION_MODEL`):** Runs local CPU ONNX inference (`onnxruntime`):
-     - `efficientnet` *(default, committed at `apps/api/models/foshollens_leaf.onnx`, 16 MB)*: EfficientNet-B0 across all 9 rice & potato classes: `potato_early_blight`, `potato_healthy`, `potato_late_blight`, `rice_bacterial_leaf_blight`, `rice_blast`, `rice_brown_spot`, `rice_healthy`, `rice_other`, and `rice_tungro`.
-     - `vit` *(selectable, `wambugu71/crop_leaf_diseases_vit_onnx`, 22 MB, downloaded on first use)*: ViT-tiny across 13 corn/potato/rice/wheat classes.
+     - `efficientnet` *(the shipped default model, committed at `apps/api/models/foshollens_leaf.onnx`, 16 MB, ~40 ms)*: EfficientNet-B0 across all 9 rice & potato classes (`potato_early_blight`, `potato_healthy`, `potato_late_blight`, `rice_bacterial_leaf_blight`, `rice_blast`, `rice_brown_spot`, `rice_healthy`, `rice_other`, and `rice_tungro`). Every disease and healthy label is surfaced to the farmer (`is_healthy` routes healthy plants to no-spray care); only `rice_other` stays non-diagnostic.
+     - `vit` *(deprecated; opt in via `VISION_MODEL=vit`, `wambugu71/crop_leaf_diseases_vit_onnx`, 22 MB)*: ViT-tiny across 13 corn/potato/rice/wheat classes (its corn and wheat classes remain unsupported).
      - Threshold (`VISION_CONFIDENCE_THRESHOLD=0.55`) is checked on raw softmax probabilities before crop filtering.
    - **Optional Bangla Voice/Text Question:** Accepts optional `question_text` (up to `300` chars) and `audio` (up to `5 MB`; `webm`, `ogg`, `mp4`, `mpeg`, `wav` with codec suffix stripping). `transcribe_bangla_question()` sends audio bytes natively to Gemini Flash (`types.Part.from_bytes`) and degrades cleanly to `None` if unconfigured or silent.
 3. **Stage 2 — BARI/BRRI Hybrid RAG & 48-Hour Weather Guard (`apps/api/app/grounding/`):**
@@ -65,8 +66,8 @@ The backend runs a 4-stage asynchronous job pipeline (`reading -> grounding -> w
 - **Shared Contracts (`packages/contracts`):** Pydantic v2 models (`apps/api/app/contracts.py`) mirrored in TypeScript/Zod (`@foshol-lens/contracts`)
 - **Backend (`apps/api`):** Python 3.12+, FastAPI, Uvicorn, Pydantic v2, `aiosqlite` (SQLite WAL), HTTPX, Pillow, NumPy, `onnxruntime`, `huggingface-hub`
 - **Vision Models:**
-  - Committed EfficientNet-B0 ONNX checkpoint (`apps/api/models/foshollens_leaf.onnx`, 9 rice & potato classes)
-  - Selectable Hugging Face ViT-tiny [`wambugu71/crop_leaf_diseases_vit`](https://huggingface.co/wambugu71/crop_leaf_diseases_vit) (`wambugu71/crop_leaf_diseases_vit_onnx`, 13 classes)
+  - Shipped EfficientNet-B0 ONNX checkpoint (`apps/api/models/foshollens_leaf.onnx`, 9 rice & potato classes) — default model
+  - Deprecated opt-in fallback: Hugging Face Vision Transformer [`wambugu71/crop_leaf_diseases_vit`](https://huggingface.co/wambugu71/crop_leaf_diseases_vit) (`wambugu71/crop_leaf_diseases_vit_onnx`, 13 classes)
 - **Embeddings & LLM / Audio AI:** Google Gemini (`google-genai` SDK) — `gemini-embedding-001` for precomputed RAG embeddings and `gemini-3.8-flash` (with fallback chain) for Bangla voice transcription and advisory generation
 - **Text-to-Speech:** [`sulabhkatiyar/indic-tiny-tts-bengali`](https://huggingface.co/sulabhkatiyar/indic-tiny-tts-bengali) (local ONNX, CPU) + `ffmpeg` -> Opus/MP3
 - **Weather API:** [Open-Meteo Forecast API](https://open-meteo.com/) (key-free, non-commercial use)

@@ -30,8 +30,6 @@ function pickRecorderMimeType(): string | undefined {
 const CROPS = [
   { id: 'rice', name: 'ধান' },
   { id: 'potato', name: 'আলু' },
-  { id: 'tomato', name: 'টমেটো' },
-  { id: 'chili', name: 'মরিচ' },
 ] as const;
 
 /**

@@ -32,11 +32,10 @@ log = logging.getLogger(__name__)
 
 #: Which KB entry is used when the classifier cannot name the disease. Every
 #: crop still gets real, curated treatment; the result says it is unconfirmed.
+#: Rice and potato only: those are the two crops the shipped model can name.
 FALLBACK_DISEASE = {
     "rice": "rice_blast",
     "potato": "potato_late_blight",
-    "tomato": "tomato_early_blight",
-    "chili": "chili_leaf_curl",
 }
 
 #: Confidence band boundaries, applied to the classifier's probability.
@@ -242,6 +241,7 @@ async def _classify(analysis_id: str, crop_id: str) -> VisionFacts:
             confidence=None,
             crop_id=None,
             disease_id=None,
+            is_healthy=False,
             model=None,
         )
     return await get_classifier().classify(image_path, crop_id)
@@ -252,9 +252,11 @@ def _resolve_disease(
 ) -> tuple[knowledge_base.DiseaseEntry | None, bool]:
     """Pick the KB entry the advice will be built on and whether it was confirmed.
 
-    A classifier match wins, including healthy/cultural/other checkpoint classes
-    that clear the confidence threshold for the requested crop. Everything else
-    falls back to one curated entry per crop and is marked unconfirmed downstream.
+    A classifier match wins — including a `healthy` match, which resolves to the
+    crop's healthy entry and carries no chemical. High-confidence `rice_other`
+    resolves to the BRRI/DAE no-blind-spray safety entry while remaining marked
+    unconfirmed. Everything else falls back to one curated entry per crop and is
+    marked unconfirmed downstream.
     """
     if vision["status"] == "identified" and vision["disease_id"]:
         matched = knowledge_base.get_disease(vision["disease_id"])
@@ -274,7 +276,8 @@ def _resolve_disease(
         if matched is not None and matched["cropId"] == crop_id:
             return matched, matched["id"] != "rice_other"
 
-    return knowledge_base.get_disease(FALLBACK_DISEASE.get(crop_id, "rice_blast")), False
+    fallback_id = FALLBACK_DISEASE.get(crop_id)
+    return (knowledge_base.get_disease(fallback_id) if fallback_id else None), False
 
 
 def _confidence_band(confidence: float | None) -> str:
@@ -372,11 +375,15 @@ def _build_facts(
     write "symptoms were observed at medium confidence" about a photo it never
     saw a result for.
     """
-    cultural_only = grounding.cultural_only if grounding.sources else (not disease["chemical"])
-    is_healthy = disease["id"].endswith("_healthy")
+    is_healthy = bool(vision.get("is_healthy")) or disease["id"].endswith("_healthy")
+    cultural_only = (
+        grounding.cultural_only
+        if grounding.sources
+        else (is_healthy or not disease["chemical"])
+    )
     refer_to_officer = (not confirmed) or grounding.refer_to_officer
 
-    if not confirmed or cultural_only:
+    if not confirmed or cultural_only or is_healthy:
         prompt_chemicals: list[dict[str, str]] = []
     elif grounding.chemicals:
         prompt_chemicals = [
@@ -402,7 +409,9 @@ def _build_facts(
     passages = [
         {
             **passage,
-            "chemicals": passage["chemicals"] if (confirmed and not cultural_only) else [],
+            "chemicals": (
+                passage["chemicals"] if (confirmed and not cultural_only and not is_healthy) else []
+            ),
         }
         for passage in grounding.prompt_passages
     ]
@@ -419,8 +428,11 @@ def _build_facts(
             "disease": f"{disease['bnName']} রোগ" if not is_healthy else disease["bnName"],
             "confidence": _confidence_label(vision["confidence"]) if confirmed else None,
             "confirmed_by": "ছবি বিশ্লেষণ" if confirmed else None,
+            "healthy": is_healthy,
         },
-        "symptoms_observed": disease["symptoms"] if confirmed else [],
+        # A healthy plant has no symptoms to describe; being explicit stops
+        # any future edit from making "no disease" read like a symptom.
+        "symptoms_observed": disease["symptoms"] if (confirmed and not is_healthy) else [],
         "treatment": {
             "organic": disease["organic"],
             "chemical": prompt_chemicals,
@@ -435,7 +447,9 @@ def _build_facts(
             "refer_to_officer": refer_to_officer,
             "is_healthy": is_healthy,
             "ppe_reminder": (
-                grounding.ppe_reminder_bn if (confirmed and not cultural_only) else None
+                grounding.ppe_reminder_bn
+                if (confirmed and not cultural_only and not is_healthy)
+                else None
             ),
             "passages": passages,
         },
@@ -484,23 +498,32 @@ def _build_result(
     district_name: str | None = None,
 ) -> dict[str, Any]:
     confidence = vision["confidence"]
-    cultural_only = grounding.cultural_only if grounding.sources else (not disease["chemical"])
-    is_healthy = disease["id"].endswith("_healthy")
+    is_healthy = bool(vision.get("is_healthy")) or disease["id"].endswith("_healthy")
+    cultural_only = (
+        grounding.cultural_only
+        if grounding.sources
+        else (is_healthy or not disease["chemical"])
+    )
     refer_to_officer = (not confirmed) or grounding.refer_to_officer
     ppe_reminder = (
         grounding.ppe_reminder_bn
-        if (confirmed and not cultural_only and grounding.ppe_reminder_bn)
+        if (confirmed and not cultural_only and not is_healthy and grounding.ppe_reminder_bn)
         else None
     )
 
     if confirmed:
         if is_healthy:
             summary = "গাছ সুস্থ আছে, কোনো রাসায়নিক স্প্রে করার প্রয়োজন নেই"
+            uncertainty_message = (
+                "আপনার গাছটি সুস্থ দেখাচ্ছে। নিয়মিত পরিচর্যা চালিয়ে যান এবং "
+                "রোগের লক্ষণ দেখা দিলে আবার ছবি দিন।"
+            )
         elif cultural_only:
             summary = "এটি ছত্রাকজনিত রোগ নয়; ছত্রাকনাশক স্প্রে কাজ করবে না। নিচের পরিচর্যাগুলো অনুসরণ করুন"
+            uncertainty_message = "এটি একটি আনুমানিক ফলাফল। নিশ্চিত হওয়ার জন্য কৃষি কর্মকর্তার পরামর্শ নিন।"
         else:
             summary = "নিচের ধাপগুলো অনুসরণ করুন"
-        uncertainty_message = "এটি একটি আনুমানিক ফলাফল। নিশ্চিত হওয়ার জন্য কৃষি কর্মকর্তার পরামর্শ নিন।"
+            uncertainty_message = "এটি একটি আনুমানিক ফলাফল। নিশ্চিত হওয়ার জন্য কৃষি কর্মকর্তার পরামর্শ নিন।"
     elif disease["id"] == "rice_other":
         summary = "রোগ নিশ্চিত নয়, তাই আন্দাজে কোনো স্প্রে করবেন না"
         uncertainty_message = (
@@ -533,14 +556,14 @@ def _build_result(
             ),
             "isAiEstimate": True,
         },
-        "symptoms": disease["symptoms"] if confirmed else [],
+        "symptoms": disease["symptoms"] if (confirmed and not is_healthy) else [],
         "treatment": {
             "summary": summary,
             "steps": _treatment_steps(
                 disease,
                 grounding,
                 confirmed=confirmed,
-                cultural_only=cultural_only,
+                cultural_only=cultural_only or is_healthy,
             ),
             "source": (
                 grounding.sources[0].source_title if grounding.sources else disease["source"]

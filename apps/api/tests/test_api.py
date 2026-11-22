@@ -151,6 +151,7 @@ def test_identified_leaf_uses_the_classifier_result(
             confidence=0.91,
             crop_id="rice",
             disease_id="rice_blast",
+            is_healthy=False,
         )
 
     monkeypatch.setattr(settings, "vision_enabled", True)
@@ -178,15 +179,15 @@ def test_history_row_carries_display_fields(client: TestClient) -> None:
     created = client.post(
         "/api/v1/analyses",
         files={"image": ("crop.jpg", _jpeg(), "image/jpeg")},
-        data={"crop": "tomato"},
+        data={"crop": "potato"},
     )
     analysis_id = created.json()["id"]
     _wait(client, analysis_id)
 
     rows = client.get("/api/v1/analyses").json()
     row = next(r for r in rows if r["id"] == analysis_id)
-    assert row["cropName"] == "টমেটো"
-    assert row["diseaseLabel"] == "টমেটোর আগাম ধসা রোগ"
+    assert row["cropName"] == "আলু"
+    assert row["diseaseLabel"] == "আলুর নাবি ধসা রোগ"
     assert row["thumbnailUrl"].endswith("/image")
 
 
@@ -336,6 +337,7 @@ def test_gemini_advisory_pipeline_conforms_to_contract(
             confidence=0.91,
             crop_id="rice",
             disease_id="rice_blast",
+            is_healthy=False,
             model="efficientnet",
         )
 

@@ -238,6 +238,7 @@ async def test_gemini_writer_receives_rag_passages_and_blocks_cultural_only_chem
             confidence=0.88,
             crop_id="rice",
             disease_id="rice_bacterial_blight",
+            is_healthy=False,
             model="efficientnet",
         ),
         confirmed=True,
@@ -309,8 +310,8 @@ async def test_gemini_writer_receives_rag_passages_and_blocks_cultural_only_chem
             True,
             False,
         ),
-        ("rice_tungro", "rice", "undetermined", None, False, True, False),
-        ("potato_healthy", "potato", "undetermined", None, False, False, False),
+        ("rice_tungro", "rice", "identified", "rice_tungro", False, True, False),
+        ("potato_healthy", "potato", "identified", "potato_healthy", False, False, False),
         ("rice_other", "rice", "undetermined", None, True, True, False),
     ],
 )
@@ -345,6 +346,7 @@ def test_pipeline_surfaces_rag_fields_in_api_result(
             confidence=0.92,
             crop_id=crop,
             disease_id=disease_id,
+            is_healthy=label.endswith("_healthy"),
             model="efficientnet",
         )
 

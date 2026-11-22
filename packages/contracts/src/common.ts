@@ -1,6 +1,9 @@
 import { z } from 'zod';
 
-export const CROPS = ['rice', 'potato', 'tomato', 'chili', 'unknown'] as const;
+// Rice and potato only: the two crops the shipped EfficientNet checkpoint can
+// name and the only ones with curated advice. Tomato and chili were removed as
+// out of scope — no model could ever name them, so offering them was a dead end.
+export const CROPS = ['rice', 'potato'] as const;
 export const CropSchema = z.enum(CROPS);
 export type Crop = z.infer<typeof CropSchema>;
 
