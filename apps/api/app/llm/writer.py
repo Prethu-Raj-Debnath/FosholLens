@@ -129,19 +129,26 @@ KNOWN_CHEMICALS_BN: tuple[str, ...] = (
 )
 
 SYSTEM_PROMPT = """\
-তুমি বাংলাদেশের একজন কৃষি পরামর্শক। কৃষকের জন্য ছোট, সহজ, মুখে বলার মতো একটি পরামর্শ লেখো।
+তুমি বাংলাদেশের একজন কৃষি পরামর্শক। নিচে দেওয়া তথ্য ও সরকারি (বারি/ব্রি) অনুমোদিত অংশগুলো থেকে
+কৃষকের জন্য ছোট, সহজ, মুখে বলার মতো একটি বাংলা পরামর্শ লেখো।
 
 নিয়ম:
 - সবসময় চলিত বাংলায়, কেবল বাংলা অক্ষরে লিখবে। কোনো ইংরেজি অক্ষর, রোমান হরফ বা ইংরেজি শব্দ ব্যবহার করবে না।
 - ২ থেকে ৪ বাক্য। ২৫ থেকে ৯০ শব্দের মধ্যে রাখবে।
 - একজন কৃষক আরেকজন কৃষককে যেভাবে বলেন, সেভাবে সরল ভাষায় লিখবে। সম্মানসূচক 'আপনি' ব্যবহার করবে।
 - কোনো মার্কডাউন, বুলেট, ইমোজি, লিংক বা তালিকা নয়। শুধু টানা বাক্য।
-- ওষুধ ও মাত্রা কেবল নিচে দেওয়া তথ্য থেকে নেবে। নিজের থেকে কোনো নতুন ওষুধ, মাত্রা বা রোগের নাম বানাবে না।
+- ওষুধ, সক্রিয় উপাদান ও মাত্রা কেবল নিচে দেওয়া অনুমোদিত তথ্য ও পুনরুদ্ধার করা অংশ থেকে নেবে।
+  নিজের থেকে কোনো নতুন ওষুধ, মাত্রা বা রোগের নাম বানাবে না।
+- যদি 'কালচারাল ওনলি' বা ছত্রাকনাশক অকার্যকর বলে উল্লেখ থাকে (যেমন ব্যাকটেরিয়াল লিফ ব্লাইট বা টুংরো),
+  তবে স্পষ্ট জানাবে যে ছত্রাকনাশক কাজ করবে না এবং শুধু পরিচর্যা ও বাহক নিয়ন্ত্রণের ধাপ বলবে।
+- যদি গাছ সুস্থ বলে উল্লেখ থাকে, তবে কোনো স্প্রে না করার কথা স্পষ্টভাবে বলবে।
 - ওষুধের নাম বাংলা অক্ষরে লিখবে, যেমনটি তথ্যে দেওয়া আছে।
 - রাসায়নিক স্প্রে উল্লেখ থাকলে সংক্ষেপে গ্লাভস ও মাস্ক পরা এবং সাবান দিয়ে হাত ধোয়ার কথা মনে করিয়ে দেবে।
 - সংখ্যা বাংলা অঙ্কে লিখবে (০-৯)।
-- আবহাওয়ার তথ্য না থাকলে আবহাওয়ার কথা একেবারেই বলবে না।
-- রোগ নিশ্চিত না হলে সেটি স্পষ্ট বলবে এবং উপজেলা কৃষি কর্মকর্তার পরামর্শ নিতে বলবে।
+- আবহাওয়ার তথ্য না থাকলে আবহাওয়ার কথা একেবারেই বলবে না। আবহাওয়ায় স্প্রে অনুকূল না থাকলে
+  অপেক্ষা করতে ও এখনই স্প্রে না করতে বলবে।
+- রোগ নিশ্চিত না হলে বা কৃষি কর্মকর্তার পরামর্শের নির্দেশ থাকলে আন্দাজে স্প্রে করতে নিষেধ করবে
+  এবং স্থানীয় উপ-সহকারী কৃষি কর্মকর্তার পরামর্শ নিতে বলবে।
 - শেষে সবসময় মনে করিয়ে দেবে যে এটি একটি আনুমানিক পরামর্শ।
 """
 
@@ -168,6 +175,28 @@ def _candidate_gemini_models() -> list[str]:
     return candidates
 
 
+def _allowed_chemicals(facts: dict[str, Any]) -> list[str]:
+    rag_grounding = facts.get("rag_grounding") or {}
+    if rag_grounding.get("cultural_only"):
+        return []
+
+    allowed: list[str] = []
+    for chemical in facts.get("treatment", {}).get("chemical", []):
+        bn_name = chemical.get("bnName") or chemical.get("bn_name")
+        if isinstance(bn_name, str) and bn_name:
+            allowed.append(bn_name)
+
+    if not facts.get("uncertain", False):
+        for passage in rag_grounding.get("passages", []):
+            if passage.get("cultural_only"):
+                continue
+            for chemical in passage.get("chemicals", []):
+                bn_name = chemical.get("bn_name") or chemical.get("bnName")
+                if isinstance(bn_name, str) and bn_name and bn_name not in allowed:
+                    allowed.append(bn_name)
+    return allowed
+
+
 class GeminiWriter:
     """Primary Bangla advisory writer backed by Google Gemini Flash."""
 
@@ -188,7 +217,7 @@ class GeminiWriter:
         self._semaphore = asyncio.Semaphore(settings.llm_max_concurrency)
 
     async def write(self, facts: dict[str, Any]) -> tuple[str, str]:
-        allowed = [chemical["bnName"] for chemical in facts["treatment"]["chemical"]]
+        allowed = _allowed_chemicals(facts)
         last_error: Exception | None = None
 
         for attempt in (1, 2):
@@ -296,7 +325,7 @@ class LlmWriter:
         self._semaphore = asyncio.Semaphore(settings.llm_max_concurrency)
 
     async def write(self, facts: dict[str, Any]) -> tuple[str, str]:
-        allowed = [chemical["bnName"] for chemical in facts["treatment"]["chemical"]]
+        allowed = _allowed_chemicals(facts)
         last_error: Exception | None = None
 
         for attempt in (1, 2):
@@ -367,14 +396,39 @@ class TemplateWriter:
         treatment = facts["treatment"]
         weather = facts.get("weather")
         uncertain: bool = facts.get("uncertain", False)
+        rag_grounding = facts.get("rag_grounding") or {}
+        cultural_only = bool(rag_grounding.get("cultural_only"))
+        is_healthy = bool(rag_grounding.get("is_healthy"))
+        refer_to_officer = bool(rag_grounding.get("refer_to_officer"))
 
         parts: list[str] = []
 
         if uncertain:
             parts.append(
                 f"আপনার {diagnosis['crop']} গাছের ছবি ভালোভাবে শনাক্ত করা যায়নি।"
-                " অনুগ্রহ করে আরও পরিষ্কার ছবি দিন, অথবা উপজেলা কৃষি কর্মকর্তাকে দেখান।"
+                " আন্দাজে কোনো ওষুধ স্প্রে করবেন না; আরও পরিষ্কার ছবি দিন, অথবা স্থানীয়"
+                " উপ-সহকারী কৃষি কর্মকর্তাকে দেখান।"
             )
+        elif is_healthy:
+            parts.append(
+                f"আপনার {diagnosis['crop']} গাছের পাতা সুস্থ আছে, এখন কোনো ছত্রাকনাশক বা"
+                " রাসায়নিক স্প্রে করার প্রয়োজন নেই।"
+            )
+            organic = treatment.get("organic") or []
+            if len(organic) > 1:
+                parts.append(f"{organic[1]}।")
+            elif facts.get("prevention"):
+                parts.append(f"{facts['prevention'][0]}।")
+        elif cultural_only:
+            parts.append(
+                f"আপনার {diagnosis['crop']} গাছে সম্ভবত {diagnosis['disease']} হয়েছে।"
+                " এতে কোনো ছত্রাকনাশক স্প্রে কাজ করবে না।"
+            )
+            organic = treatment.get("organic") or []
+            if organic:
+                parts.append(f"{organic[0]}।")
+            if refer_to_officer:
+                parts.append("সঠিক পরামর্শের জন্য স্থানীয় উপ-সহকারী কৃষি কর্মকর্তাকে দেখান।")
         else:
             parts.append(f"আপনার {diagnosis['crop']} গাছে সম্ভবত {diagnosis['disease']} হয়েছে।")
 
@@ -392,10 +446,10 @@ class TemplateWriter:
             elif treatment.get("organic"):
                 parts.append(f"{treatment['organic'][0]}।")
 
-        if weather:
-            if weather["spray_window_ok"]:
+        if weather and not is_healthy:
+            if weather["spray_window_ok"] and not cultural_only and not uncertain:
                 parts.append("আবহাওয়া এখন স্প্রে করার অনুকূল।")
-            else:
+            elif not weather["spray_window_ok"]:
                 parts.append(f"তবে এখনই স্প্রে করবেন না, কারণ {weather['reason']}।")
 
         parts.append("মনে রাখবেন, এটি একটি আনুমানিক পরামর্শ।")

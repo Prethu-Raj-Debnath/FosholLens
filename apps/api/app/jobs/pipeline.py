@@ -20,7 +20,7 @@ from typing import Any
 
 from .. import store
 from ..config import settings
-from ..grounding import knowledge_base
+from ..grounding import knowledge_base, rag
 from ..grounding.districts import get_district
 from ..grounding.weather import fetch_weather
 from ..llm.writer import InvalidNarrative, get_writer
@@ -85,7 +85,7 @@ async def _pipeline(analysis_id: str, crop_id: str, district_id: str | None) -> 
     await store.update_stage(analysis_id, "reading", "processing")
 
     vision = await _classify(analysis_id, crop_id)
-    disease = _resolve_disease(crop_id, vision)
+    disease, confirmed = _resolve_disease(crop_id, vision)
     if disease is None:
         await store.mark_failed(analysis_id, "knowledge_base_miss")
         return
@@ -102,7 +102,26 @@ async def _pipeline(analysis_id: str, crop_id: str, district_id: str | None) -> 
             district_name=str(district["name"]),
         )
 
-    facts = _build_facts(disease, weather, vision)
+    query_parts = [disease["diseaseLabel"], disease["bnName"]]
+    if confirmed:
+        query_parts.extend(disease["symptoms"][:2])
+    if weather is not None and not weather.spray_window_ok:
+        query_parts.append("rain wind spray warning")
+    grounding = await asyncio.to_thread(
+        rag.retrieve_grounding_bundle,
+        disease["id"],
+        disease["cropId"],
+        " ".join(query_parts),
+        3,
+    )
+
+    facts = _build_facts(
+        disease,
+        weather,
+        vision,
+        confirmed=confirmed,
+        grounding=grounding,
+    )
 
     await store.update_stage(analysis_id, "writing")
     narrative, generated_by = await _write(facts)
@@ -114,6 +133,8 @@ async def _pipeline(analysis_id: str, crop_id: str, district_id: str | None) -> 
         narrative,
         generated_by,
         vision=vision,
+        confirmed=confirmed,
+        grounding=grounding,
         district_name=str(district["name"]) if district else None,
     )
     await store.save_result(analysis_id, result, disease_id=disease["id"])
@@ -123,7 +144,7 @@ async def _pipeline(analysis_id: str, crop_id: str, district_id: str | None) -> 
     # `/audio` answers 202 until the file exists.
     if settings.tts_enabled:
         await store.update_stage(analysis_id, "speaking", "completed")
-        task = asyncio.create_task(_speak(analysis_id, narrative, disease))
+        task = asyncio.create_task(_speak(analysis_id, narrative, disease, grounding))
         _tasks.add(task)
         task.add_done_callback(_tasks.discard)
     else:
@@ -145,23 +166,39 @@ async def _classify(analysis_id: str, crop_id: str) -> VisionFacts:
             confidence=None,
             crop_id=None,
             disease_id=None,
+            model=None,
         )
     return await get_classifier().classify(image_path, crop_id)
 
 
-def _resolve_disease(crop_id: str, vision: VisionFacts) -> knowledge_base.DiseaseEntry | None:
-    """Pick the KB entry the advice will be built on.
+def _resolve_disease(
+    crop_id: str, vision: VisionFacts
+) -> tuple[knowledge_base.DiseaseEntry | None, bool]:
+    """Pick the KB entry the advice will be built on and whether it was confirmed.
 
-    A classifier match wins, but only if the entry it points at exists — the
-    mapping is kept narrow on purpose. Everything else falls back to one curated
-    entry per crop and is marked unconfirmed downstream, so the farmer still gets
-    correct treatment steps for their crop.
+    A classifier match wins, including healthy/cultural/other checkpoint classes
+    that clear the confidence threshold for the requested crop. Everything else
+    falls back to one curated entry per crop and is marked unconfirmed downstream.
     """
     if vision["status"] == "identified" and vision["disease_id"]:
         matched = knowledge_base.get_disease(vision["disease_id"])
         if matched is not None:
-            return matched
-    return knowledge_base.get_disease(FALLBACK_DISEASE.get(crop_id, "rice_blast"))
+            return matched, matched["id"] != "rice_other"
+
+    label = vision.get("label")
+    confidence = vision.get("confidence")
+    if (
+        vision["status"] == "undetermined"
+        and label
+        and confidence is not None
+        and confidence >= settings.vision_confidence_threshold
+    ):
+        normalized = rag.normalize_disease_id(label)
+        matched = knowledge_base.get_disease(normalized)
+        if matched is not None and matched["cropId"] == crop_id:
+            return matched, matched["id"] != "rice_other"
+
+    return knowledge_base.get_disease(FALLBACK_DISEASE.get(crop_id, "rice_blast")), False
 
 
 def _confidence_band(confidence: float | None) -> str:
@@ -185,20 +222,28 @@ async def _write(facts: dict[str, Any]) -> tuple[str, str]:
         return await TemplateWriter().write(facts)
 
 
-async def _speak(analysis_id: str, narrative: str, disease: knowledge_base.DiseaseEntry) -> None:
+async def _speak(
+    analysis_id: str,
+    narrative: str,
+    disease: knowledge_base.DiseaseEntry,
+    grounding: rag.GroundingBundle,
+) -> None:
     """Synthesise in the background, then close out the stage.
 
     Every exit path moves the stage to `done`. Leaving a row at `speaking` after
     a TTS failure would mean a result that never looks finished.
     """
     try:
-        await _speak_inner(analysis_id, narrative, disease)
+        await _speak_inner(analysis_id, narrative, disease, grounding)
     finally:
         await store.update_stage(analysis_id, "done", "completed")
 
 
 async def _speak_inner(
-    analysis_id: str, narrative: str, disease: knowledge_base.DiseaseEntry
+    analysis_id: str,
+    narrative: str,
+    disease: knowledge_base.DiseaseEntry,
+    grounding: rag.GroundingBundle,
 ) -> None:
     engine = get_engine()
     if not engine.available:
@@ -206,7 +251,12 @@ async def _speak_inner(
         return
 
     await store.update_audio(analysis_id, {"status": "pending", "url": None})
-    terms = [chemical["bnName"] for chemical in disease["chemical"]]
+    terms = list(
+        dict.fromkeys(
+            [chemical["bnName"] for chemical in disease["chemical"]]
+            + [chemical["bn_name"] for chemical in grounding.chemicals]
+        )
+    )
     try:
         clip = await engine.synthesise(narrative, settings.audio_dir, required_terms=terms)
     except TtsSafetyError as exc:
@@ -231,7 +281,12 @@ async def _speak_inner(
 
 
 def _build_facts(
-    disease: knowledge_base.DiseaseEntry, weather: Any, vision: VisionFacts
+    disease: knowledge_base.DiseaseEntry,
+    weather: Any,
+    vision: VisionFacts,
+    *,
+    confirmed: bool,
+    grounding: rag.GroundingBundle,
 ) -> dict[str, Any]:
     """The exact shape handed to the LLM. Facts only, no instructions.
 
@@ -240,44 +295,97 @@ def _build_facts(
     write "symptoms were observed at medium confidence" about a photo it never
     saw a result for.
     """
-    identified = vision["status"] == "identified"
+    cultural_only = grounding.cultural_only if grounding.sources else (not disease["chemical"])
+    is_healthy = disease["id"].endswith("_healthy")
+    refer_to_officer = (not confirmed) or grounding.refer_to_officer
+
+    if not confirmed or cultural_only:
+        prompt_chemicals: list[dict[str, str]] = []
+    elif grounding.chemicals:
+        prompt_chemicals = [
+            {
+                "product": chemical["active_ingredient"],
+                "bnName": chemical["bn_name"],
+                "dose": chemical["dose"],
+                "phi": chemical["phi"],
+            }
+            for chemical in grounding.chemicals
+        ]
+    else:
+        prompt_chemicals = [
+            {
+                "product": chemical["product"],
+                "bnName": chemical["bnName"],
+                "dose": chemical["dose"],
+                "note": chemical["note"],
+            }
+            for chemical in disease["chemical"]
+        ]
+
+    passages = [
+        {
+            **passage,
+            "chemicals": passage["chemicals"] if (confirmed and not cultural_only) else [],
+        }
+        for passage in grounding.prompt_passages
+    ]
+
     return {
         "diagnosis": {
             "crop": disease["cropName"],
             # The short name, so the narrative reads "ধানে ব্লাস্ট" rather than
             # "ধানে ধানের ব্লাস্ট". The full label is used in the result card.
-            "disease": f"{disease['bnName']} রোগ",
-            "confidence": _confidence_label(vision["confidence"]) if identified else None,
-            "confirmed_by": "ছবি বিশ্লেষণ" if identified else None,
+            "disease": f"{disease['bnName']} রোগ" if not is_healthy else disease["bnName"],
+            "confidence": _confidence_label(vision["confidence"]) if confirmed else None,
+            "confirmed_by": "ছবি বিশ্লেষণ" if confirmed else None,
         },
-        "symptoms_observed": disease["symptoms"] if identified else [],
+        "symptoms_observed": disease["symptoms"] if confirmed else [],
         "treatment": {
             "organic": disease["organic"],
-            "chemical": (
-                [
-                    {
-                        "product": chemical["product"],
-                        "bnName": chemical["bnName"],
-                        "dose": chemical["dose"],
-                        "note": chemical["note"],
-                    }
-                    for chemical in disease["chemical"]
-                ]
-                if identified
-                # No identified disease means no chemical reaches the model, so
-                # it cannot phrase a dose the evidence does not support.
-                else []
-            ),
+            "chemical": prompt_chemicals,
         },
         "prevention": disease["prevention"],
         "weather": weather.as_prompt_facts() if weather else None,
-        "uncertain": not identified,
+        "uncertain": not confirmed,
+        "rag_grounding": {
+            "disease_id": grounding.normalized_disease_id or disease["id"],
+            "cultural_only": cultural_only,
+            "refer_to_officer": refer_to_officer,
+            "is_healthy": is_healthy,
+            "ppe_reminder": (
+                grounding.ppe_reminder_bn if (confirmed and not cultural_only) else None
+            ),
+            "passages": passages,
+        },
     }
 
 
 def _confidence_label(confidence: float | None) -> str:
     """Bangla band name, matching what the UI shows."""
     return {"high": "বেশি", "medium": "মাঝারি", "low": "কম"}[_confidence_band(confidence)]
+
+
+def _treatment_steps(
+    disease: knowledge_base.DiseaseEntry,
+    grounding: rag.GroundingBundle,
+    *,
+    confirmed: bool,
+    cultural_only: bool,
+) -> list[str]:
+    if not confirmed or cultural_only:
+        return list(disease["organic"])
+
+    if grounding.chemicals:
+        chem_steps = [
+            f"{chem['bn_name']}: {chem['dose']} (ফসল তোলার আগে বিরতি: {chem['phi']})"
+            for chem in grounding.chemicals
+        ]
+    else:
+        chem_steps = [
+            f"{chemical['bnName']}: {chemical['dose']} ({chemical['note']})"
+            for chemical in disease["chemical"]
+        ]
+    return chem_steps + list(disease["organic"])
 
 
 def _build_result(
@@ -288,9 +396,42 @@ def _build_result(
     generated_by: str,
     *,
     vision: VisionFacts,
+    confirmed: bool,
+    grounding: rag.GroundingBundle,
     district_name: str | None = None,
 ) -> dict[str, Any]:
-    identified = vision["status"] == "identified"
+    confidence = vision["confidence"]
+    cultural_only = grounding.cultural_only if grounding.sources else (not disease["chemical"])
+    is_healthy = disease["id"].endswith("_healthy")
+    refer_to_officer = (not confirmed) or grounding.refer_to_officer
+    ppe_reminder = (
+        grounding.ppe_reminder_bn
+        if (confirmed and not cultural_only and grounding.ppe_reminder_bn)
+        else None
+    )
+
+    if confirmed:
+        if is_healthy:
+            summary = "গাছ সুস্থ আছে, কোনো রাসায়নিক স্প্রে করার প্রয়োজন নেই"
+        elif cultural_only:
+            summary = "এটি ছত্রাকজনিত রোগ নয়; ছত্রাকনাশক স্প্রে কাজ করবে না। নিচের পরিচর্যাগুলো অনুসরণ করুন"
+        else:
+            summary = "নিচের ধাপগুলো অনুসরণ করুন"
+        uncertainty_message = "এটি একটি আনুমানিক ফলাফল। নিশ্চিত হওয়ার জন্য কৃষি কর্মকর্তার পরামর্শ নিন।"
+    elif disease["id"] == "rice_other":
+        summary = "রোগ নিশ্চিত নয়, তাই আন্দাজে কোনো স্প্রে করবেন না"
+        uncertainty_message = (
+            "এই লক্ষণটি আওতাভুক্ত ৪টি ধান রোগের সাথে মেলেনি। আন্দাজে কোনো ওষুধ স্প্রে করবেন না; "
+            "আরও পরিষ্কার ছবি দিন অথবা স্থানীয় উপ-সহকারী কৃষি কর্মকর্তার পরামর্শ নিন।"
+        )
+    else:
+        summary = f"{disease['cropName']} ফসলের জন্য সাধারণ পরিচর্যা"
+        uncertainty_message = (
+            "ছবি থেকে রোগ নিশ্চিতভাবে শনাক্ত করা যায়নি। নিচের পরামর্শটি "
+            f"{disease['cropName']} ফসলের সাধারণ নির্দেশনা। সঠিক রোগ নিশ্চিত করতে "
+            "আরও পরিষ্কার ছবি দিন, অথবা উপজেলা কৃষি কর্মকর্তার পরামর্শ নিন।"
+        )
+
     return {
         "id": analysis_id,
         "createdAt": datetime.now(UTC).isoformat(),
@@ -303,42 +444,33 @@ def _build_result(
             "cropName": disease["cropName"],
             # Still null on a miss: the label shown is the fallback entry, and
             # attaching a number to it would be inventing evidence.
-            "confidence": (round(vision["confidence"], 3) if identified else None),
-            "confidenceBand": _confidence_band(vision["confidence"]) if identified else "low",
+            "confidence": round(confidence, 3) if (confirmed and confidence is not None) else None,
+            "confidenceBand": (
+                _confidence_band(confidence) if (confirmed and confidence is not None) else "low"
+            ),
             "isAiEstimate": True,
         },
-        "symptoms": disease["symptoms"] if identified else [],
+        "symptoms": disease["symptoms"] if confirmed else [],
         "treatment": {
-            "summary": (
-                "নিচের ধাপগুলো অনুসরণ করুন"
-                if identified
-                else f"{disease['cropName']} ফসলের জন্য সাধারণ পরিচর্যা"
+            "summary": summary,
+            "steps": _treatment_steps(
+                disease,
+                grounding,
+                confirmed=confirmed,
+                cultural_only=cultural_only,
             ),
-            "steps": (
-                [
-                    f"{chemical['bnName']}: {chemical['dose']} ({chemical['note']})"
-                    for chemical in disease["chemical"]
-                ]
-                + disease["organic"]
-                if identified
-                # A dose is disease-specific. Listing one for a disease nobody
-                # confirmed would be a precise instruction with no evidence
-                # behind it, which is worse than no instruction at all.
-                else disease["organic"]
+            "source": (
+                grounding.sources[0].source_title if grounding.sources else disease["source"]
             ),
-            "source": disease["source"],
         },
         "prevention": disease["prevention"],
         "needsProfessionalVerification": True,
+        "ragSources": [source.to_contract_dict() for source in grounding.sources],
+        "ppeReminder": ppe_reminder,
+        "referToOfficer": refer_to_officer,
         "uncertainty": {
-            "isUncertain": not identified,
-            "message": (
-                "এটি একটি আনুমানিক ফলাফল। নিশ্চিত হওয়ার জন্য কৃষি কর্মকর্তার পরামর্শ নিন।"
-                if identified
-                else "ছবি থেকে রোগ নিশ্চিতভাবে শনাক্ত করা যায়নি। নিচের পরামর্শটি "
-                f"{disease['cropName']} ফসলের সাধারণ নির্দেশনা। সঠিক রোগ নিশ্চিত করতে "
-                "আরও পরিষ্কার ছবি দিন, অথবা উপজেলা কৃষি কর্মকর্তার পরামর্শ নিন।"
-            ),
+            "isUncertain": not confirmed,
+            "message": uncertainty_message,
         },
         "narrative": narrative,
         "generatedBy": generated_by,

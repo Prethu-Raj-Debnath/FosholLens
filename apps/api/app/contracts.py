@@ -45,6 +45,18 @@ class Treatment(BaseModel):
     source: str | None = None
 
 
+class RagSource(BaseModel):
+    """A grounded BARI/BRRI passage cited for this advisory."""
+
+    chunkId: str
+    sourceTitle: str
+    section: str
+    diseaseId: str
+    excerpt: str
+    culturalOnly: bool = False
+    referToOfficer: bool = False
+
+
 class Uncertainty(BaseModel):
     isUncertain: bool
     message: str
@@ -95,6 +107,9 @@ class AnalysisResult(BaseModel):
     treatment: Treatment | None = None
     prevention: list[str] = Field(default_factory=list)
     needsProfessionalVerification: bool = True
+    ragSources: list[RagSource] = Field(default_factory=list)
+    ppeReminder: str | None = None
+    referToOfficer: bool = False
     uncertainty: Uncertainty
     #: Short friendly Bangla text, shown in the UI and spoken by TTS.
     narrative: str = ""

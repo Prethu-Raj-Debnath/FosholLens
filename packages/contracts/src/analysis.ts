@@ -64,6 +64,17 @@ export const TreatmentSchema = z.object({
 });
 export type Treatment = z.infer<typeof TreatmentSchema>;
 
+export const RagSourceSchema = z.object({
+  chunkId: z.string(),
+  sourceTitle: z.string(),
+  section: z.string(),
+  diseaseId: z.string(),
+  excerpt: z.string(),
+  culturalOnly: z.boolean().default(false),
+  referToOfficer: z.boolean().default(false),
+});
+export type RagSource = z.infer<typeof RagSourceSchema>;
+
 export const AnalysisUncertaintySchema = z.object({
   isUncertain: z.boolean(),
   message: z.string(),
@@ -95,6 +106,9 @@ export const AnalysisResultSchema = z.object({
   treatment: TreatmentSchema.nullable(),
   prevention: z.array(z.string()),
   needsProfessionalVerification: z.boolean(),
+  ragSources: z.array(RagSourceSchema).default([]),
+  ppeReminder: z.string().nullable().optional(),
+  referToOfficer: z.boolean().default(false),
   uncertainty: AnalysisUncertaintySchema,
   /** Short friendly Bangla text, shown in the UI and spoken by TTS. */
   narrative: z.string().default(''),

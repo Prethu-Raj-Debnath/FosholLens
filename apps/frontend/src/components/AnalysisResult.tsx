@@ -1,5 +1,5 @@
 import type { AnalysisResult } from '@foshol-lens/contracts';
-import { ChevronLeft } from 'lucide-react';
+import { BookOpen, ChevronLeft, ShieldAlert, UserCheck } from 'lucide-react';
 import { Link } from 'react-router-dom';
 import { mediaUrl } from '../lib/api-client';
 import { formatBengaliDate } from '../lib/format';
@@ -96,6 +96,16 @@ export function AnalysisResultView({ result }: { result: AnalysisResult }) {
             </section>
           )}
 
+          {result.ppeReminder && (
+            <section className="card card--warn" aria-label="নিরাপত্তা নির্দেশনা">
+              <div className="ppe-card__header">
+                <ShieldAlert size={18} strokeWidth={2.1} aria-hidden="true" />
+                <h2 className="card__label">নিরাপত্তা নির্দেশনা (PPE)</h2>
+              </div>
+              <p className="card__text">{result.ppeReminder}</p>
+            </section>
+          )}
+
           {result.weather ? (
             <WeatherCard weather={result.weather} />
           ) : (
@@ -123,15 +133,58 @@ export function AnalysisResultView({ result }: { result: AnalysisResult }) {
             </section>
           )}
 
-          {result.needsProfessionalVerification && !uncertainty.isUncertain && (
-            <div className="notice">
+          {result.ragSources && result.ragSources.length > 0 && (
+            <section className="card card--plain" aria-label="BARI ও BRRI তথ্যসূত্র">
+              <div className="rag-sources__header">
+                <BookOpen size={17} strokeWidth={2.1} aria-hidden="true" />
+                <h2 className="card__label">তথ্যসূত্র (BARI/BRRI)</h2>
+                <span className="badge badge--ok">যাচাইকৃত নির্দেশিকা</span>
+              </div>
+              <ul className="rag-sources__list">
+                {result.ragSources.map((src) => (
+                  <li key={src.chunkId} className="rag-source">
+                    <div className="rag-source__meta">
+                      <span className="rag-source__title">{src.sourceTitle}</span>
+                      {src.culturalOnly && (
+                        <span className="badge badge--warn">রাসায়নিকমুক্ত পরামর্শ</span>
+                      )}
+                    </div>
+                    <p className="rag-source__section">{src.section}</p>
+                    <p className="rag-source__excerpt">{src.excerpt}</p>
+                  </li>
+                ))}
+              </ul>
+            </section>
+          )}
+
+          {result.referToOfficer ? (
+            <div className="notice" role="note">
               <div>
-                <p className="notice__title">পেশাদার যাচাই প্রয়োজন</p>
+                <div className="notice__header">
+                  <UserCheck size={18} strokeWidth={2.1} aria-hidden="true" />
+                  <p className="notice__title">
+                    উপ-সহকারী কৃষি কর্মকর্তা (SAAO)-এর পরামর্শ নিন
+                  </p>
+                </div>
                 <p className="notice__text">
-                  চূড়ান্ত সিদ্ধান্তের জন্য স্থানীয় কৃষি কর্মকর্তার পরামর্শ নিন।
+                  {uncertainty.isUncertain
+                    ? 'রোগটি নিশ্চিতভাবে শনাক্ত করা যায়নি। আন্দাজে কোনো ওষুধ স্প্রে না করে সরাসরি স্থানীয় উপ-সহকারী কৃষি কর্মকর্তা (SAAO) অথবা উপজেলা কৃষি অফিসে যোগাযোগ করুন।'
+                    : 'এই রোগে সাধারণ ছত্রাকনাশক স্প্রে কার্যকর নয়। মাঠ পর্যায়ের সঠিক ব্যবস্থাপনার জন্য দ্রুত স্থানীয় উপ-সহকারী কৃষি কর্মকর্তা (SAAO)-এর সাথে পরামর্শ করুন।'}
                 </p>
               </div>
             </div>
+          ) : (
+            result.needsProfessionalVerification &&
+            !uncertainty.isUncertain && (
+              <div className="notice">
+                <div>
+                  <p className="notice__title">পেশাদার যাচাই প্রয়োজন</p>
+                  <p className="notice__text">
+                    চূড়ান্ত সিদ্ধান্তের জন্য স্থানীয় কৃষি কর্মকর্তার পরামর্শ নিন।
+                  </p>
+                </div>
+              </div>
+            )
           )}
         </div>
       </div>
