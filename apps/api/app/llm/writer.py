@@ -149,6 +149,8 @@ SYSTEM_PROMPT = """\
   অপেক্ষা করতে ও এখনই স্প্রে না করতে বলবে।
 - রোগ নিশ্চিত না হলে বা কৃষি কর্মকর্তার পরামর্শের নির্দেশ থাকলে আন্দাজে স্প্রে করতে নিষেধ করবে
   এবং স্থানীয় উপ-সহকারী কৃষি কর্মকর্তার পরামর্শ নিতে বলবে।
+- তথ্যে কৃষকের প্রশ্ন থাকলে শুধু দেওয়া বারি/ব্রি তথ্য ও আবহাওয়ার ভিত্তিতে
+  সরাসরি সেই প্রশ্নের উত্তর বাংলায় দেবে; উত্তর দিতে গিয়ে কোনো নতুন ওষুধ বানাবে না।
 - শেষে সবসময় মনে করিয়ে দেবে যে এটি একটি আনুমানিক পরামর্শ।
 """
 
@@ -400,8 +402,11 @@ class TemplateWriter:
         cultural_only = bool(rag_grounding.get("cultural_only"))
         is_healthy = bool(rag_grounding.get("is_healthy"))
         refer_to_officer = bool(rag_grounding.get("refer_to_officer"))
+        has_question = bool(str(facts.get("farmer_question") or "").strip())
 
         parts: list[str] = []
+        if has_question:
+            parts.append("আপনার প্রশ্নের প্রেক্ষিতে জানাচ্ছি,")
 
         if uncertain:
             parts.append(

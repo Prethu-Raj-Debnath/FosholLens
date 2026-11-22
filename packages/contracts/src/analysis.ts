@@ -112,6 +112,7 @@ export const AnalysisResultSchema = z.object({
   uncertainty: AnalysisUncertaintySchema,
   /** Short friendly Bangla text, shown in the UI and spoken by TTS. */
   narrative: z.string().default(''),
+  farmerQuestion: z.string().nullable().optional(),
   /** 'template' means the LLM was unavailable and facts were composed directly. */
   generatedBy: z.enum(['llm', 'template']).default('template'),
   weather: WeatherSchema.nullable().optional(),

@@ -38,6 +38,9 @@ class Settings(BaseSettings):
     llm_model: str = "openai/gpt-6-luna"
     llm_timeout_ms: int = 15_000
     llm_max_concurrency: int = Field(default=3, ge=1, le=10)
+    max_question_chars: int = Field(default=300, ge=50, le=1000)
+    max_audio_upload_bytes: int = Field(default=5 * 1024 * 1024, ge=1024)
+    audio_transcription_timeout_ms: int = Field(default=12_000, ge=1000)
 
     # ---- vision (optional: without a model every diagnosis is unconfirmed)
     vision_enabled: bool = True

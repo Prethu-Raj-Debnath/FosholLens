@@ -23,6 +23,7 @@ from ..config import settings
 from ..grounding import knowledge_base, rag
 from ..grounding.districts import get_district
 from ..grounding.weather import fetch_weather
+from ..llm.audio_input import transcribe_bangla_question
 from ..llm.writer import InvalidNarrative, get_writer
 from ..tts.engine import TtsSafetyError, get_engine
 from ..vision import VisionFacts, get_classifier
@@ -64,27 +65,98 @@ def _semaphore_for_current_loop() -> asyncio.Semaphore:
 _tasks: set[asyncio.Task[None]] = set()
 
 
-def spawn(analysis_id: str, crop_id: str, district_id: str | None) -> None:
+def spawn(
+    analysis_id: str,
+    crop_id: str,
+    district_id: str | None,
+    *,
+    question_text: str | None = None,
+    audio_bytes: bytes | None = None,
+    audio_mime: str | None = None,
+) -> None:
     """Start a pipeline run in the background."""
-    task = asyncio.create_task(run(analysis_id, crop_id, district_id))
+    task = asyncio.create_task(
+        run(
+            analysis_id,
+            crop_id,
+            district_id,
+            question_text=question_text,
+            audio_bytes=audio_bytes,
+            audio_mime=audio_mime,
+        )
+    )
     _tasks.add(task)
     task.add_done_callback(_tasks.discard)
 
 
-async def run(analysis_id: str, crop_id: str, district_id: str | None) -> None:
+async def run(
+    analysis_id: str,
+    crop_id: str,
+    district_id: str | None,
+    *,
+    question_text: str | None = None,
+    audio_bytes: bytes | None = None,
+    audio_mime: str | None = None,
+) -> None:
     """Run the whole pipeline. Never raises: failures are recorded on the row."""
     async with _semaphore_for_current_loop():
         try:
-            await _pipeline(analysis_id, crop_id, district_id)
+            await _pipeline(
+                analysis_id,
+                crop_id,
+                district_id,
+                question_text=question_text,
+                audio_bytes=audio_bytes,
+                audio_mime=audio_mime,
+            )
         except Exception as exc:
             log.exception("analysis %s failed", analysis_id)
             await store.mark_failed(analysis_id, exc.__class__.__name__)
 
 
-async def _pipeline(analysis_id: str, crop_id: str, district_id: str | None) -> None:
+def _combine_farmer_question(
+    question_text: str | None,
+    transcribed_voice: str | None,
+) -> str | None:
+    parts: list[str] = []
+    for item in (question_text, transcribed_voice):
+        if item:
+            cleaned = " ".join(item.split()).strip()
+            if cleaned and cleaned not in parts:
+                parts.append(cleaned)
+    if not parts:
+        return None
+    if len(parts) == 1:
+        combined = parts[0]
+    else:
+        first, second = parts[0], parts[1]
+        sep = " " if first.endswith(("।", "?", "!", ".", ",")) else "। "
+        combined = f"{first}{sep}{second}"
+    return combined[: settings.max_question_chars].strip() or None
+
+
+async def _pipeline(
+    analysis_id: str,
+    crop_id: str,
+    district_id: str | None,
+    *,
+    question_text: str | None = None,
+    audio_bytes: bytes | None = None,
+    audio_mime: str | None = None,
+) -> None:
     await store.update_stage(analysis_id, "reading", "processing")
 
-    vision = await _classify(analysis_id, crop_id)
+    if audio_bytes and audio_mime:
+        vision, transcribed_voice = await asyncio.gather(
+            _classify(analysis_id, crop_id),
+            transcribe_bangla_question(audio_bytes, audio_mime, settings),
+        )
+    else:
+        vision = await _classify(analysis_id, crop_id)
+        transcribed_voice = None
+
+    farmer_question = _combine_farmer_question(question_text, transcribed_voice)
+
     disease, confirmed = _resolve_disease(crop_id, vision)
     if disease is None:
         await store.mark_failed(analysis_id, "knowledge_base_miss")
@@ -107,11 +179,13 @@ async def _pipeline(analysis_id: str, crop_id: str, district_id: str | None) -> 
         query_parts.extend(disease["symptoms"][:2])
     if weather is not None and not weather.spray_window_ok:
         query_parts.append("rain wind spray warning")
+    rag_query = farmer_question if farmer_question else " ".join(query_parts)
+
     grounding = await asyncio.to_thread(
         rag.retrieve_grounding_bundle,
         disease["id"],
         disease["cropId"],
-        " ".join(query_parts),
+        rag_query,
         3,
     )
 
@@ -121,6 +195,7 @@ async def _pipeline(analysis_id: str, crop_id: str, district_id: str | None) -> 
         vision,
         confirmed=confirmed,
         grounding=grounding,
+        farmer_question=farmer_question,
     )
 
     await store.update_stage(analysis_id, "writing")
@@ -135,6 +210,7 @@ async def _pipeline(analysis_id: str, crop_id: str, district_id: str | None) -> 
         vision=vision,
         confirmed=confirmed,
         grounding=grounding,
+        farmer_question=farmer_question,
         district_name=str(district["name"]) if district else None,
     )
     await store.save_result(analysis_id, result, disease_id=disease["id"])
@@ -287,6 +363,7 @@ def _build_facts(
     *,
     confirmed: bool,
     grounding: rag.GroundingBundle,
+    farmer_question: str | None = None,
 ) -> dict[str, Any]:
     """The exact shape handed to the LLM. Facts only, no instructions.
 
@@ -347,6 +424,7 @@ def _build_facts(
         "prevention": disease["prevention"],
         "weather": weather.as_prompt_facts() if weather else None,
         "uncertain": not confirmed,
+        "farmer_question": farmer_question,
         "rag_grounding": {
             "disease_id": grounding.normalized_disease_id or disease["id"],
             "cultural_only": cultural_only,
@@ -398,6 +476,7 @@ def _build_result(
     vision: VisionFacts,
     confirmed: bool,
     grounding: rag.GroundingBundle,
+    farmer_question: str | None = None,
     district_name: str | None = None,
 ) -> dict[str, Any]:
     confidence = vision["confidence"]
@@ -473,6 +552,7 @@ def _build_result(
             "message": uncertainty_message,
         },
         "narrative": narrative,
+        "farmerQuestion": farmer_question,
         "generatedBy": generated_by,
         "weather": (
             {

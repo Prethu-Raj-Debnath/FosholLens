@@ -1,5 +1,5 @@
 import type { AnalysisResult } from '@foshol-lens/contracts';
-import { BookOpen, ChevronLeft, ShieldAlert, UserCheck } from 'lucide-react';
+import { BookOpen, ChevronLeft, MessageSquare, ShieldAlert, UserCheck } from 'lucide-react';
 import { Link } from 'react-router-dom';
 import { mediaUrl } from '../lib/api-client';
 import { formatBengaliDate } from '../lib/format';
@@ -44,6 +44,16 @@ export function AnalysisResultView({ result }: { result: AnalysisResult }) {
                   নতুন ছবি দিন
                 </Link>
               </div>
+            </div>
+          )}
+
+          {result.farmerQuestion && (
+            <div className="question-chip" aria-label="আপনার প্রশ্ন">
+              <div className="question-chip__label">
+                <MessageSquare size={15} strokeWidth={2.1} aria-hidden="true" />
+                <span>আপনার প্রশ্ন</span>
+              </div>
+              <p className="question-chip__text">{result.farmerQuestion}</p>
             </div>
           )}
 

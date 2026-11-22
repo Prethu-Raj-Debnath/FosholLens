@@ -113,6 +113,7 @@ class AnalysisResult(BaseModel):
     uncertainty: Uncertainty
     #: Short friendly Bangla text, shown in the UI and spoken by TTS.
     narrative: str = ""
+    farmerQuestion: str | None = None
     generatedBy: GeneratedBy = "template"
     weather: Weather | None = None
     audio: AudioInfo = Field(default_factory=AudioInfo)

@@ -19,6 +19,8 @@ export interface CreateAnalysisInput {
   imageBlob: Blob;
   crop: string;
   district: string | null;
+  questionText?: string | null;
+  audioBlob?: Blob | null;
 }
 
 export interface Created {
@@ -76,12 +78,32 @@ export function mediaUrl(path: string | null | undefined): string | undefined {
   return `${BASE_URL}${path}`;
 }
 
+function audioFilenameForMime(mimeType: string): string {
+  const base = (mimeType.split(';', 1)[0] ?? '').trim().toLowerCase();
+  if (base === 'audio/ogg') return 'question.ogg';
+  if (base === 'audio/mp4') return 'question.m4a';
+  if (base === 'audio/mpeg') return 'question.mp3';
+  if (base === 'audio/wav') return 'question.wav';
+  return 'question.webm';
+}
+
 export const api = {
-  async createAnalysis({ imageBlob, crop, district }: CreateAnalysisInput): Promise<Created> {
+  async createAnalysis({
+    imageBlob,
+    crop,
+    district,
+    questionText,
+    audioBlob,
+  }: CreateAnalysisInput): Promise<Created> {
     const body = new FormData();
     body.append('image', imageBlob, 'crop.jpg');
     body.append('crop', crop);
     if (district) body.append('district', district);
+    const trimmedQuestion = questionText?.trim();
+    if (trimmedQuestion) body.append('question_text', trimmedQuestion);
+    if (audioBlob && audioBlob.size > 0) {
+      body.append('audio', audioBlob, audioFilenameForMime(audioBlob.type));
+    }
 
     const response = await request('/analyses', { method: 'POST', body });
     return (await response.json()) as Created;

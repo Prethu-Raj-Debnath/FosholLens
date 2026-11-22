@@ -32,10 +32,29 @@ from .vision.classifier import get_classifier
 router = APIRouter()
 
 MAX_UPLOAD_BYTES = 8 * 1024 * 1024
+ALLOWED_AUDIO_MIMES = frozenset(
+    {"audio/webm", "audio/ogg", "audio/mp4", "audio/mpeg", "audio/wav"}
+)
 JPEG_QUALITY = 82
 MAX_IMAGE_EDGE = 1280
 
 VERSION = "0.1.0"
+
+
+def _normalize_audio_mime(content_type: str | None) -> str:
+    """Strip codec parameters such as `;codecs=opus` and normalise case."""
+    if not content_type:
+        return ""
+    return content_type.split(";", 1)[0].strip().lower()
+
+
+def _clean_question_text(value: str | None) -> str | None:
+    if not value:
+        return None
+    collapsed = " ".join(value.split()).strip()
+    if not collapsed:
+        return None
+    return collapsed[: settings.max_question_chars].strip() or None
 
 
 def _summary_from_row(row: dict[str, Any]) -> AnalysisSummary:
@@ -113,6 +132,8 @@ async def create_analysis(
     image: Annotated[UploadFile, File()],
     crop: Annotated[str, Form()] = "rice",
     district: Annotated[str | None, Form()] = None,
+    question_text: Annotated[str | None, Form()] = None,
+    audio: Annotated[UploadFile | None, File()] = None,
 ) -> CreateAnalysisResponse:
     raw = await image.read()
     if not raw:
@@ -122,6 +143,21 @@ async def create_analysis(
 
     if district is not None and get_district(district) is None:
         raise HTTPException(status_code=400, detail="unknown_district")
+
+    cleaned_question = _clean_question_text(question_text)
+
+    audio_bytes: bytes | None = None
+    audio_mime: str | None = None
+    if audio is not None:
+        raw_audio = await audio.read()
+        if raw_audio:
+            if len(raw_audio) > settings.max_audio_upload_bytes:
+                raise HTTPException(status_code=413, detail="audio_too_large")
+            normalized_mime = _normalize_audio_mime(audio.content_type)
+            if normalized_mime not in ALLOWED_AUDIO_MIMES:
+                raise HTTPException(status_code=400, detail="unsupported_audio_type")
+            audio_bytes = raw_audio
+            audio_mime = normalized_mime
 
     analysis_id = str(uuid.uuid4())
     created_at = datetime.now(UTC).isoformat()
@@ -142,7 +178,14 @@ async def create_analysis(
         raise HTTPException(status_code=400, detail="image_unreadable") from exc
 
     # Fire and forget: the client polls status.
-    pipeline.spawn(analysis_id, crop, district)
+    pipeline.spawn(
+        analysis_id,
+        crop,
+        district,
+        question_text=cleaned_question,
+        audio_bytes=audio_bytes,
+        audio_mime=audio_mime,
+    )
 
     return CreateAnalysisResponse(
         id=analysis_id,

@@ -1,8 +1,9 @@
 import type { AnalysisStage } from '@foshol-lens/contracts';
-import { ScanSearch } from 'lucide-react';
+import { Mic, ScanSearch, Square, Trash2 } from 'lucide-react';
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { api, ApiError } from '../lib/api-client';
+import { toBengaliDigits } from '../lib/format';
 import { prepareImage } from '../lib/image';
 import { useDistrict } from '../lib/use-district';
 import { AnalysisLoadingState, type UploadPhase } from './AnalysisLoadingState';
@@ -10,6 +11,21 @@ import { ImageDropzone } from './ImageDropzone';
 import { ImagePreview } from './ImagePreview';
 
 const MAX_BYTES = 8 * 1024 * 1024;
+const MAX_RECORDING_SECONDS = 12;
+const MAX_QUESTION_CHARS = 300;
+const RECORDING_MIMES = [
+  'audio/webm;codecs=opus',
+  'audio/webm',
+  'audio/ogg;codecs=opus',
+  'audio/mp4',
+] as const;
+
+function pickRecorderMimeType(): string | undefined {
+  if (typeof MediaRecorder === 'undefined' || typeof MediaRecorder.isTypeSupported !== 'function') {
+    return undefined;
+  }
+  return RECORDING_MIMES.find((mime) => MediaRecorder.isTypeSupported(mime));
+}
 
 const CROPS = [
   { id: 'rice', name: 'ধান' },
@@ -35,6 +51,12 @@ function describeFailure(error: unknown): string {
     }
     if (error.code === 'analysis_failed') {
       return 'ছবিটি বিশ্লেষণ করা যায়নি। আরও পরিষ্কার ছবি দিয়ে আবার চেষ্টা করুন';
+    }
+    if (error.code === 'audio_too_large') {
+      return 'ভয়েস রেকর্ডিং ৫ মেগাবাইটের কম হতে হবে';
+    }
+    if (error.code === 'unsupported_audio_type') {
+      return 'এই অডিও ফরম্যাটটি সমর্থিত নয়';
     }
     if (error.status === 413) {
       return 'ছবির আকার বেশি বড়। ছোট ছবি দিয়ে আবার চেষ্টা করুন';
@@ -66,11 +88,44 @@ export function CropUploadCard() {
   const [phase, setPhase] = useState<UploadPhase>('idle');
   const [stage, setStage] = useState<AnalysisStage | undefined>();
   const [errorMessage, setErrorMessage] = useState<string | undefined>();
+  const [questionText, setQuestionText] = useState('');
+  const [recording, setRecording] = useState(false);
+  const [recordingSeconds, setRecordingSeconds] = useState(0);
+  const [audioBlob, setAudioBlob] = useState<Blob | null>(null);
+  const [audioPreviewUrl, setAudioPreviewUrl] = useState<string | null>(null);
+  const [micNote, setMicNote] = useState<string | null>(null);
 
   // Object URL for the on-screen preview, revoked on replace/unmount.
   const previewRef = useRef<string | null>(null);
+  const audioPreviewRef = useRef<string | null>(null);
+  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+  const mediaStreamRef = useRef<MediaStream | null>(null);
+  const timerRef = useRef<number | null>(null);
   // Guards against double-submits from rapid taps/keyboard repeat.
   const submittingRef = useRef(false);
+
+  const stopStream = useCallback(() => {
+    if (timerRef.current !== null) {
+      window.clearInterval(timerRef.current);
+      timerRef.current = null;
+    }
+    if (mediaStreamRef.current) {
+      for (const track of mediaStreamRef.current.getTracks()) {
+        track.stop();
+      }
+      mediaStreamRef.current = null;
+    }
+  }, []);
+
+  const clearAudio = useCallback(() => {
+    if (audioPreviewRef.current) {
+      URL.revokeObjectURL(audioPreviewRef.current);
+      audioPreviewRef.current = null;
+    }
+    setAudioPreviewUrl(null);
+    setAudioBlob(null);
+    setRecordingSeconds(0);
+  }, []);
 
   const clearPreview = useCallback(() => {
     if (previewRef.current) {
@@ -81,6 +136,12 @@ export function CropUploadCard() {
   }, []);
 
   useEffect(() => clearPreview, [clearPreview]);
+  useEffect(() => {
+    return () => {
+      stopStream();
+      clearAudio();
+    };
+  }, [stopStream, clearAudio]);
 
   function handleFile(nextFile: File) {
     if (submittingRef.current) return;
@@ -111,8 +172,82 @@ export function CropUploadCard() {
     setErrorMessage(undefined);
   }
 
+  function stopRecording() {
+    const recorder = mediaRecorderRef.current;
+    if (recorder && recorder.state !== 'inactive') {
+      recorder.stop();
+    }
+    stopStream();
+    setRecording(false);
+  }
+
+  async function toggleRecording() {
+    if (busy) return;
+    if (recording) {
+      stopRecording();
+      return;
+    }
+
+    if (
+      typeof MediaRecorder === 'undefined' ||
+      !navigator.mediaDevices ||
+      typeof navigator.mediaDevices.getUserMedia !== 'function'
+    ) {
+      setMicNote('এই ব্রাউজারে ভয়েস রেকর্ডিং সমর্থিত নয়; নিচে লিখে প্রশ্ন করুন।');
+      return;
+    }
+
+    setMicNote(null);
+    clearAudio();
+
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      mediaStreamRef.current = stream;
+
+      const mimeType = pickRecorderMimeType();
+      const recorder = mimeType
+        ? new MediaRecorder(stream, { mimeType })
+        : new MediaRecorder(stream);
+      mediaRecorderRef.current = recorder;
+
+      const chunks: BlobPart[] = [];
+      recorder.ondataavailable = (event) => {
+        if (event.data.size > 0) chunks.push(event.data);
+      };
+      recorder.onstop = () => {
+        stopStream();
+        setRecording(false);
+        const finalType = recorder.mimeType || mimeType || 'audio/webm';
+        const recorded = new Blob(chunks, { type: finalType });
+        if (recorded.size > 0) {
+          const url = URL.createObjectURL(recorded);
+          audioPreviewRef.current = url;
+          setAudioBlob(recorded);
+          setAudioPreviewUrl(url);
+        }
+      };
+
+      recorder.start();
+      setRecording(true);
+      setRecordingSeconds(0);
+
+      const startedAt = Date.now();
+      timerRef.current = window.setInterval(() => {
+        const elapsed = Math.floor((Date.now() - startedAt) / 1000);
+        setRecordingSeconds(Math.min(elapsed, MAX_RECORDING_SECONDS));
+        if (elapsed >= MAX_RECORDING_SECONDS && mediaRecorderRef.current?.state === 'recording') {
+          mediaRecorderRef.current.stop();
+        }
+      }, 250);
+    } catch {
+      stopStream();
+      setRecording(false);
+      setMicNote('মাইক্রোফোন ব্যবহারের অনুমতি পাওয়া যায়নি; নিচে লিখে প্রশ্ন করুন।');
+    }
+  }
+
   async function handleAnalyze() {
-    if (!file || submittingRef.current) return;
+    if (!file || submittingRef.current || recording) return;
 
     submittingRef.current = true;
     setPhase('uploading');
@@ -132,6 +267,8 @@ export function CropUploadCard() {
         imageBlob: prepared.blob,
         crop,
         district: district || null,
+        questionText,
+        audioBlob,
       });
 
       const result = await api.waitForResult(created.id, (nextStage) => setStage(nextStage));
@@ -204,10 +341,67 @@ export function CropUploadCard() {
         </label>
       </div>
 
+      <div className="question-box">
+        <div className="question-box__header">
+          <span className="field__label">ঐচ্ছিক প্রশ্ন (ভয়েস বা টেক্সট)</span>
+          {recording && (
+            <span className="question-box__timer" aria-live="polite">
+              <span className="record-dot" aria-hidden="true" />
+              {toBengaliDigits(recordingSeconds)} / {toBengaliDigits(MAX_RECORDING_SECONDS)} সে.
+            </span>
+          )}
+        </div>
+
+        <div className="question-box__controls">
+          <button
+            type="button"
+            className={`record-btn ${recording ? 'record-btn--active' : ''}`}
+            disabled={busy}
+            onClick={toggleRecording}
+          >
+            {recording ? (
+              <Square size={15} strokeWidth={2.2} aria-hidden="true" />
+            ) : (
+              <Mic size={16} strokeWidth={2.1} aria-hidden="true" />
+            )}
+            {recording ? 'রেকর্ডিং থামান' : audioBlob ? 'নতুন করে রেকর্ড করুন' : 'ভয়েসে প্রশ্ন করুন'}
+          </button>
+
+          <input
+            type="text"
+            className="field__input question-box__text"
+            value={questionText}
+            disabled={busy}
+            maxLength={MAX_QUESTION_CHARS}
+            onChange={(event) => setQuestionText(event.target.value)}
+            placeholder="যেমন: আজ বৃষ্টি হলে কি স্প্রে করব?"
+            aria-label="ঐচ্ছিক প্রশ্ন লিখুন"
+          />
+        </div>
+
+        {audioPreviewUrl && !recording && (
+          <div className="question-audio">
+            <audio controls src={audioPreviewUrl} className="question-audio__player" />
+            <button
+              type="button"
+              className="question-audio__clear"
+              disabled={busy}
+              onClick={clearAudio}
+              aria-label="রেকর্ডিং মুছুন"
+            >
+              <Trash2 size={15} strokeWidth={2.1} aria-hidden="true" />
+              মুছুন
+            </button>
+          </div>
+        )}
+
+        {micNote && <p className="question-box__note">{micNote}</p>}
+      </div>
+
       <button
         type="button"
         className="button-primary"
-        disabled={!file || busy}
+        disabled={!file || busy || recording}
         onClick={handleAnalyze}
       >
         {busy ? (
