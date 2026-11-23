@@ -32,12 +32,6 @@ _TOKEN_RE = re.compile(r"[\u0980-\u09FF]+|[a-z0-9_]+")
 _VISION_ALIAS_MAP: dict[str, str] = {
     "rice_bacterial_blight": "rice_bacterial_leaf_blight",
     "rice_bacterial_leaf_blight": "rice_bacterial_leaf_blight",
-    "rice___leaf_blast": "rice_blast",
-    "rice___brown_spot": "rice_brown_spot",
-    "rice___healthy": "rice_healthy",
-    "potato___early_blight": "potato_early_blight",
-    "potato___late_blight": "potato_late_blight",
-    "potato___healthy": "potato_healthy",
 }
 
 _CROP_ALIAS_MAP: dict[str, str] = {
@@ -374,44 +368,33 @@ def _select_candidates(norm_disease: str, norm_crop: str, corpus: list[RagChunk]
         if any_crop and (not norm_crop or norm_crop == "unknown"):
             return any_crop
 
-    # Out-of-scope or unrecognized rice symptom safely falls back to the DAE/BRRI
-    # no-blind-spray protocol.
-    if norm_crop == "rice":
-        return [chunk for chunk in corpus if chunk["disease_id"] == "rice_other"]
-
     return []
 
 
 def _safe_fallback_candidates(norm_crop: str, corpus: list[RagChunk]) -> list[RagChunk]:
-    """Return safe non-chemical/scouting/SAAO passages for uncertain diagnoses."""
+    """Return safe non-chemical scouting/monitoring passages for uncertain diagnoses."""
     if norm_crop == "rice":
-        rice_other = [chunk for chunk in corpus if chunk["disease_id"] == "rice_other"]
-        if rice_other:
-            return rice_other
+        rice_scouting = [
+            chunk for chunk in corpus if chunk["chunk_id"] == "brri_rice_healthy_02"
+        ]
+        if rice_scouting:
+            return rice_scouting
 
     if norm_crop == "potato":
-        potato_safe = [
-            chunk
-            for cid in ("brri_dae_rice_other_02", "bari_potato_healthy_02")
-            for chunk in corpus
-            if chunk["chunk_id"] == cid
+        potato_scouting = [
+            chunk for chunk in corpus if chunk["chunk_id"] == "bari_potato_healthy_02"
         ]
-        if potato_safe:
-            return potato_safe
+        if potato_scouting:
+            return potato_scouting
 
-    saao_photo = [chunk for chunk in corpus if chunk["chunk_id"] == "brri_dae_rice_other_02"]
-    if saao_photo:
-        return saao_photo
-
-    officer_cultural = [
+    both_scouting = [
         chunk
+        for cid in ("brri_rice_healthy_02", "bari_potato_healthy_02")
         for chunk in corpus
-        if chunk.get("cultural_only")
-        and chunk.get("refer_to_officer")
-        and not chunk.get("chemicals")
+        if chunk["chunk_id"] == cid
     ]
-    if officer_cultural:
-        return officer_cultural
+    if both_scouting:
+        return both_scouting
 
     return [
         chunk
@@ -443,17 +426,23 @@ def retrieve_grounding_bundle(
     norm_disease = normalize_disease_id(disease_id)
     norm_crop = _normalize_crop_id(crop_id)
 
-    if norm_disease == "uncertain":
+    used_uncertain_fallback = norm_disease == "uncertain"
+    if used_uncertain_fallback:
         candidates = _safe_fallback_candidates(norm_crop, corpus)
     else:
         candidates = _select_candidates(norm_disease, norm_crop, corpus)
         if not candidates:
+            used_uncertain_fallback = True
             candidates = _safe_fallback_candidates(norm_crop, corpus)
 
     selected = _rank_candidates(candidates, query_text)[:top_k]
 
-    cultural_only = any(chunk.get("cultural_only", False) for chunk in selected)
-    refer_to_officer = any(chunk.get("refer_to_officer", False) for chunk in selected)
+    cultural_only = used_uncertain_fallback or any(
+        chunk.get("cultural_only", False) for chunk in selected
+    )
+    refer_to_officer = used_uncertain_fallback or any(
+        chunk.get("refer_to_officer", False) for chunk in selected
+    )
     chemicals = [] if cultural_only else _dedupe_chemicals(selected)
 
     ppe_reminder_bn = next(
@@ -501,8 +490,8 @@ def retrieve_grounding_bundle(
         for chunk in selected
     ]
 
-    if norm_disease == "uncertain":
-        resolved_id = "rice_other" if norm_crop == "rice" else "uncertain"
+    if used_uncertain_fallback:
+        resolved_id = "uncertain"
     else:
         resolved_id = selected[0]["disease_id"] if selected else norm_disease
     return GroundingBundle(

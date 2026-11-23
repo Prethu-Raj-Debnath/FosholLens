@@ -1,13 +1,14 @@
 """The classifier's decision logic.
 
 These tests exercise `_decide` with injected probabilities instead of running
-the model: the weights are a 16-22 MB download, and the interesting decisions
-are all about what to do with a probability vector, not about computing one.
+the model: the weights are a 16 MB artifact, and the interesting decisions are
+all about what to do with a probability vector, not about computing one.
 
-The regression this suite exists for is the renormalisation bug: filtering onto
-the requested crop's classes *before* applying the confidence threshold lets a
-corn leaf clear 0.55 as "rice blast", because the evidence that the photo was
-the wrong crop is thrown away by the renormalisation itself.
+The rule under test is the one in `predict_final.py`: choose the best class
+inside the selected crop, but judge it on its raw, unmasked probability. Masking
+is for ranking only — thresholding the renormalised value would let a
+wrong-crop photo clear the bar, because renormalisation throws away the
+evidence that the photo was mostly another crop.
 """
 
 from __future__ import annotations
@@ -19,7 +20,7 @@ import pytest
 
 from app.config import settings
 from app.vision.classifier import LeafClassifier, _decide, _softmax, missing_weights
-from app.vision.models import EFFICIENTNET, SPECS, VIT, ModelSpec, get_spec
+from app.vision.models import EFFICIENTNET, ModelSpec
 
 
 def _probs(spec: ModelSpec, **weights: float) -> np.ndarray:
@@ -30,110 +31,179 @@ def _probs(spec: ModelSpec, **weights: float) -> np.ndarray:
     return vector
 
 
-# ---------------------------------------------------------------- vit ------
-def test_vit_labels_match_the_exported_graph() -> None:
-    assert len(VIT["labels"]) == 13
+# ------------------------------------------------------------ checkpoint -----
+def test_labels_match_the_shipped_checkpoint() -> None:
+    assert len(EFFICIENTNET["labels"]) == 8
+    assert EFFICIENTNET["input_name"] == "input"
+    assert EFFICIENTNET["input_size"] == 320
+    # ImageNet statistics.
+    assert EFFICIENTNET["mean"] == (0.485, 0.456, 0.406)
     # Order is part of the model contract, so a silent reorder is a bug.
-    assert VIT["labels"][9] == "Rice___Leaf_Blast"
-    assert VIT["labels"][3] == "Invalid"
-    assert VIT["input_name"] == "pixel_values"
-    assert VIT["input_size"] == 224
+    assert EFFICIENTNET["labels"][3] == "rice_bacterial_leaf_blight"
 
 
 def test_confident_rice_blast_resolves_to_the_kb_entry() -> None:
-    facts = _decide(_probs(VIT, Rice___Leaf_Blast=0.9, Invalid=0.05), "rice", VIT)
+    facts = _decide(_probs(EFFICIENTNET, rice_blast=0.9), "rice", EFFICIENTNET)
     assert facts["status"] == "identified"
     assert facts["disease_id"] == "rice_blast"
     assert facts["confidence"] == pytest.approx(0.9)
-    assert facts["model"] == "vit"
+    assert facts["model"] == "efficientnet"
 
 
 def test_below_threshold_is_undetermined() -> None:
-    facts = _decide(_probs(VIT, Rice___Leaf_Blast=0.4), "rice", VIT)
+    facts = _decide(_probs(EFFICIENTNET, rice_blast=0.4), "rice", EFFICIENTNET)
     assert facts["status"] == "undetermined"
     assert facts["disease_id"] is None
     # The raw number is kept for the UI, but never promoted to a diagnosis.
     assert facts["confidence"] == pytest.approx(0.4)
 
 
-def test_threshold_is_applied_to_raw_mass_not_renormalised() -> None:
-    """A corn leaf must not become a confident rice diagnosis.
+def test_margin_accepts_a_clear_winner_below_the_main_threshold(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A clear winner just under the threshold is not a refusal.
 
-    `Rice___Leaf_Blast` is the highest *rice* class here, but the crop mass is
-    tiny. Renormalising onto rice first — then thresholding — would report
+    Raw 0.50 is below the 0.60 primary threshold, but it beats the runner-up by
+    0.40 and the photo is 70% rice, so the margin path accepts it.
+    """
+    monkeypatch.setattr(settings, "vision_confidence_threshold", 0.6)
+    monkeypatch.setattr(settings, "vision_margin_floor", 0.45)
+    monkeypatch.setattr(settings, "vision_margin", 0.30)
+    monkeypatch.setattr(settings, "vision_margin_min_crop_mass", 0.70)
+
+    facts = _decide(
+        _probs(
+            EFFICIENTNET,
+            rice_blast=0.50,
+            rice_brown_spot=0.10,
+            rice_healthy=0.10,
+            potato_late_blight=0.05,
+        ),
+        "rice",
+        EFFICIENTNET,
+    )
+    assert facts["status"] == "identified"
+    assert facts["disease_id"] == "rice_blast"
+    assert facts["confidence"] == pytest.approx(0.50)
+
+
+def test_margin_requires_a_clear_gap(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Two close classes are ambiguous, even if the winner clears the floor."""
+    monkeypatch.setattr(settings, "vision_confidence_threshold", 0.6)
+    monkeypatch.setattr(settings, "vision_margin_floor", 0.45)
+    monkeypatch.setattr(settings, "vision_margin", 0.30)
+    monkeypatch.setattr(settings, "vision_margin_min_crop_mass", 0.70)
+
+    facts = _decide(
+        _probs(EFFICIENTNET, rice_blast=0.50, rice_brown_spot=0.40, potato_late_blight=0.05),
+        "rice",
+        EFFICIENTNET,
+    )
+    assert facts["status"] == "undetermined"
+
+
+def test_margin_requires_most_of_the_belief_in_the_selected_crop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A clear potato winner must not be accepted as a rice answer."""
+    monkeypatch.setattr(settings, "vision_confidence_threshold", 0.6)
+    monkeypatch.setattr(settings, "vision_margin_floor", 0.45)
+    monkeypatch.setattr(settings, "vision_margin", 0.30)
+    monkeypatch.setattr(settings, "vision_margin_min_crop_mass", 0.70)
+
+    facts = _decide(
+        _probs(EFFICIENTNET, rice_blast=0.50, potato_late_blight=0.40),
+        "rice",
+        EFFICIENTNET,
+    )
+    assert facts["status"] == "undetermined"
+
+
+def test_margin_does_not_go_below_its_floor(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A large gap at very low confidence is still not enough evidence."""
+    monkeypatch.setattr(settings, "vision_confidence_threshold", 0.6)
+    monkeypatch.setattr(settings, "vision_margin_floor", 0.45)
+    monkeypatch.setattr(settings, "vision_margin", 0.30)
+    monkeypatch.setattr(settings, "vision_margin_min_crop_mass", 0.70)
+
+    facts = _decide(
+        _probs(
+            EFFICIENTNET,
+            rice_blast=0.44,
+            rice_healthy=0.16,
+            rice_brown_spot=0.05,
+            rice_bacterial_leaf_blight=0.05,
+            potato_late_blight=0.10,
+        ),
+        "rice",
+        EFFICIENTNET,
+    )
+    assert facts["status"] == "undetermined"
+
+
+def test_confidence_is_raw_not_renormalised() -> None:
+    """Masking ranks classes; it must not inflate the reported confidence.
+
+    `rice_blast` is 0.7 of the full distribution and 0.875 of the rice-only
+    mass. The farmer sees 0.7, because that is the model's actual evidence.
+    """
+    facts = _decide(
+        _probs(EFFICIENTNET, rice_blast=0.7, rice_brown_spot=0.1, potato_late_blight=0.2),
+        "rice",
+        EFFICIENTNET,
+    )
+    assert facts["status"] == "identified"
+    assert facts["disease_id"] == "rice_blast"
+    assert facts["confidence"] == pytest.approx(0.7)
+
+
+def test_threshold_is_applied_to_raw_mass_not_renormalised() -> None:
+    """A potato leaf must not become a confident rice diagnosis.
+
+    `rice_blast` is the highest *rice* class here, but its raw probability is
+    0.015. Renormalising onto rice first — then thresholding — would report
     ~0.75 confidence; the raw probability is 0.015 and must be judged as such.
     """
     facts = _decide(
-        _probs(VIT, Corn___Common_Rust=0.5, Corn___Gray_Leaf_Spot=0.48, Rice___Leaf_Blast=0.015),
+        _probs(
+            EFFICIENTNET,
+            potato_late_blight=0.5,
+            potato_early_blight=0.48,
+            rice_blast=0.015,
+        ),
         "rice",
-        VIT,
+        EFFICIENTNET,
     )
     assert facts["status"] == "undetermined"
     assert facts["disease_id"] is None
+    assert facts["confidence"] == pytest.approx(0.015)
 
 
 def test_winning_label_from_another_crop_is_undetermined() -> None:
-    facts = _decide(_probs(VIT, Corn___Common_Rust=0.9), "rice", VIT)
+    facts = _decide(
+        _probs(EFFICIENTNET, potato_late_blight=0.9, rice_blast=0.02),
+        "rice",
+        EFFICIENTNET,
+    )
     assert facts["status"] == "undetermined"
-    assert facts["confidence"] == pytest.approx(0.9)
+    assert facts["confidence"] == pytest.approx(0.02)
 
 
-def test_vit_invalid_label_is_never_a_disease() -> None:
-    facts = _decide(_probs(VIT, Invalid=0.99), "rice", VIT)
-    assert facts["status"] == "undetermined"
-    assert facts["disease_id"] is None
-
-
-def test_vit_healthy_labels_resolve_to_a_healthy_answer() -> None:
-    """The deprecated ViT still carries healthy classes; they are a real answer."""
-    facts = _decide(_probs(VIT, Rice___Healthy=0.9), "rice", VIT)
-    assert facts["status"] == "identified"
-    assert facts["is_healthy"] is True
-    assert facts["disease_id"] == "rice_healthy"
-
-
-def test_vit_corn_and_wheat_have_no_kb_entry() -> None:
-    """The deprecated ViT can name crops this app does not support.
-
-    Emitting a treatment anyway would mean writing a dose we have no source for.
-    """
-    for label in ("Corn___Common_Rust", "Wheat___Brown_Rust"):
-        assert label not in VIT["label_disease"]
-        facts = _decide(_probs(VIT, **{label: 0.9}), "rice", VIT)
-        assert facts["status"] == "undetermined"
-
-
-# -------------------------------------------------------- efficientnet -----
-def test_efficientnet_labels_match_the_shipped_checkpoint() -> None:
-    assert len(EFFICIENTNET["labels"]) == 9
-    assert EFFICIENTNET["input_name"] == "input"
-    assert EFFICIENTNET["input_size"] == 320
-    # ImageNet statistics, not the 0.5/0.5 the ViT uses.
-    assert EFFICIENTNET["mean"] == (0.485, 0.456, 0.406)
-
-
-def test_efficientnet_covers_bacterial_blight() -> None:
-    """The one disease it can name that the ViT cannot."""
+def test_covers_bacterial_blight() -> None:
     facts = _decide(_probs(EFFICIENTNET, rice_bacterial_leaf_blight=0.88), "rice", EFFICIENTNET)
     assert facts["status"] == "identified"
     # Checkpoint spelling differs from the KB id; the mapping is explicit.
     assert facts["disease_id"] == "rice_bacterial_blight"
 
 
-def test_efficientnet_rice_other_is_not_a_disease() -> None:
-    facts = _decide(_probs(EFFICIENTNET, rice_other=0.9), "rice", EFFICIENTNET)
-    assert facts["status"] == "undetermined"
-
-
-def test_efficientnet_tungro_resolves_to_its_kb_entry() -> None:
-    """Tungro used to be unmapped; it now has curated advice."""
+def test_tungro_resolves_to_its_kb_entry() -> None:
     facts = _decide(_probs(EFFICIENTNET, rice_tungro=0.9), "rice", EFFICIENTNET)
     assert facts["status"] == "identified"
     assert facts["disease_id"] == "rice_tungro"
     assert facts["is_healthy"] is False
 
 
-def test_efficientnet_brown_spot_resolves_to_its_kb_entry() -> None:
+def test_brown_spot_resolves_to_its_kb_entry() -> None:
     """The regression that started this: brown spot was recognised and dropped."""
     facts = _decide(_probs(EFFICIENTNET, rice_brown_spot=0.96), "rice", EFFICIENTNET)
     assert facts["status"] == "identified"
@@ -152,25 +222,15 @@ def test_efficientnet_brown_spot_resolves_to_its_kb_entry() -> None:
         ("potato_late_blight", "potato", "potato_late_blight"),
     ],
 )
-def test_every_efficientnet_disease_label_is_surfaced(
-    label: str, crop: str, disease_id: str
-) -> None:
-    """Every disease class the shipped model can emit must reach the farmer.
-
-    This is the point of the change: the model naming a disease the app has
-    advice for must never be swallowed into a generic "could not identify".
-    """
+def test_every_disease_label_is_surfaced(label: str, crop: str, disease_id: str) -> None:
+    """Every disease class the shipped model can emit must reach the farmer."""
     facts = _decide(_probs(EFFICIENTNET, **{label: 0.9}), crop, EFFICIENTNET)
     assert facts["status"] == "identified"
     assert facts["disease_id"] == disease_id
 
 
-def test_efficientnet_respects_the_requested_crop() -> None:
-    """A potato label must not answer a rice question.
-
-    `predict.py` in the delivered zip ignored the crop entirely, so this is the
-    behaviour the app adds on top of it.
-    """
+def test_respects_the_requested_crop() -> None:
+    """A potato label must not answer a rice question."""
     facts = _decide(_probs(EFFICIENTNET, potato_late_blight=0.95), "rice", EFFICIENTNET)
     assert facts["status"] == "undetermined"
 
@@ -179,7 +239,7 @@ def test_efficientnet_respects_the_requested_crop() -> None:
     ("label", "crop", "disease_id"),
     [("rice_healthy", "rice", "rice_healthy"), ("potato_healthy", "potato", "potato_healthy")],
 )
-def test_efficientnet_healthy_is_surfaced_as_a_healthy_answer(
+def test_healthy_is_surfaced_as_a_healthy_answer(
     label: str, crop: str, disease_id: str
 ) -> None:
     """Healthy is a real result, not a miss.
@@ -201,21 +261,32 @@ def test_efficientnet_healthy_is_surfaced_as_a_healthy_answer(
 
 
 def test_crops_outside_rice_and_potato_are_undetermined() -> None:
-    """Tomato and chili are out of scope: no checkpoint can name them."""
+    """Tomato and chili are out of scope: the checkpoint cannot name them."""
     for crop in ("tomato", "chili"):
-        for spec in (VIT, EFFICIENTNET):
-            label = spec["labels"][0]
-            facts = _decide(_probs(spec, **{label: 0.95}), crop, spec)
-            assert facts["status"] == "undetermined", (spec["id"], crop)
+        label = EFFICIENTNET["labels"][0]
+        facts = _decide(_probs(EFFICIENTNET, **{label: 0.95}), crop, EFFICIENTNET)
+        assert facts["status"] == "undetermined", crop
 
 
 # ------------------------------------------------------------- shared ------
 def test_threshold_comes_from_settings(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(settings, "vision_confidence_threshold", 0.95)
-    assert _decide(_probs(VIT, Rice___Leaf_Blast=0.9), "rice", VIT)["status"] == "undetermined"
+    # Two close classes: the margin path cannot rescue this, so the raised
+    # threshold is what keeps it undetermined.
+    assert (
+        _decide(
+            _probs(EFFICIENTNET, rice_blast=0.9, rice_brown_spot=0.85),
+            "rice",
+            EFFICIENTNET,
+        )["status"]
+        == "undetermined"
+    )
 
     monkeypatch.setattr(settings, "vision_confidence_threshold", 0.2)
-    assert _decide(_probs(VIT, Rice___Leaf_Blast=0.3), "rice", VIT)["status"] == "identified"
+    assert (
+        _decide(_probs(EFFICIENTNET, rice_blast=0.3), "rice", EFFICIENTNET)["status"]
+        == "identified"
+    )
 
 
 def test_softmax_is_numerically_stable() -> None:
@@ -226,30 +297,24 @@ def test_softmax_is_numerically_stable() -> None:
     assert probabilities.sum() == pytest.approx(1.0, abs=1e-6)
 
 
-def test_both_specs_only_map_labels_onto_real_kb_entries() -> None:
+def test_spec_only_maps_labels_onto_real_kb_entries() -> None:
     """A typo in a label_to_disease table would otherwise fail silently."""
     from app.grounding import knowledge_base
 
-    for spec in SPECS.values():
-        for label, disease_id in spec["label_disease"].items():
-            assert label in spec["labels"], f"{spec['id']}: {label} not in labels"
-            assert knowledge_base.get_disease(disease_id) is not None, (
-                f"{spec['id']}: {label} -> {disease_id} has no KB entry"
-            )
-
-
-def test_unknown_model_id_is_rejected_clearly() -> None:
-    with pytest.raises(ValueError, match="unknown vision model"):
-        get_spec("resnet")
+    for label, disease_id in EFFICIENTNET["label_disease"].items():
+        assert label in EFFICIENTNET["labels"], f"{label} not in labels"
+        assert knowledge_base.get_disease(disease_id) is not None, (
+            f"{label} -> {disease_id} has no KB entry"
+        )
 
 
 # ------------------------------------------------------- health truthfulness
 def test_status_is_ready_only_when_the_local_checkpoint_exists(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The bug this guards: `VISION_ENABLED=true` used to mean `vision: ready`.
+    """`VISION_ENABLED=true` must not mean `vision: ready` without the file.
 
-    A fresh clone has the flag set and no weights, so `/health` claimed the
+    A fresh clone has the flag set and no weights, so `/health` would claim the
     stage was fine while every upload silently returned `undetermined`.
     """
     monkeypatch.setattr(settings, "vision_enabled", True)
@@ -270,22 +335,10 @@ def test_status_is_unavailable_when_vision_is_disabled(tmp_path: Path, monkeypat
     assert LeafClassifier(EFFICIENTNET).status == "unavailable"
 
 
-def test_hub_checkpoint_is_not_reported_missing_offline(monkeypatch) -> None:
-    """`/health` must not hit the network; a Hub spec is not probed."""
-    monkeypatch.setattr(settings, "vision_enabled", True)
-    assert missing_weights(VIT) is None
-    assert LeafClassifier(VIT).status == "ready"
-
-
 def test_relative_model_dir_is_anchored_to_the_api_package(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """`.env.example` documents `./models`; that must not be CWD-relative.
-
-    A literal reading resolves against wherever uvicorn was launched from, so
-    the same `.env` worked under `npm run dev:api` (which `cd`s into apps/api)
-    and silently found nothing from the repo root.
-    """
+    """`.env.example` documents `./models`; that must not be CWD-relative."""
     from app.config import API_ROOT, Settings
 
     env = tmp_path / ".env"
@@ -305,28 +358,25 @@ def test_absolute_model_dir_is_left_alone(tmp_path: Path) -> None:
 
 
 # ------------------------------------------------------------ coverage ------
-def test_every_efficientnet_label_is_either_mapped_or_explicitly_non_diagnostic() -> None:
+def test_every_label_is_mapped() -> None:
     """No label may silently fall through unmapped.
 
     This is the guard for the brown-spot bug: a class the model is confident
-    about but the app has no treatment for is a dead end for the farmer. Each
-    label must either reach a KB entry or be listed as deliberately
-    non-diagnostic, so adding a class to the checkpoint forces a decision here.
+    about but the app has no treatment for is a dead end for the farmer. Adding
+    a class to the checkpoint must force a mapping decision here.
     """
     for label in EFFICIENTNET["labels"]:
-        mapped = label in EFFICIENTNET["label_disease"]
-        ignored = label in EFFICIENTNET["non_diagnostic"]
-        assert mapped != ignored, f"{label} must be exactly one of mapped/non-diagnostic"
+        assert label in EFFICIENTNET["label_disease"], label
 
 
-def test_efficientnet_has_no_missing_kb_entries() -> None:
+def test_has_no_missing_kb_entries() -> None:
     from app.grounding import knowledge_base
 
     for label, disease_id in EFFICIENTNET["label_disease"].items():
         assert knowledge_base.get_disease(disease_id) is not None, (label, disease_id)
 
 
-def test_supported_crops_match_the_efficientnet_classes() -> None:
+def test_supported_crops_match_the_model_classes() -> None:
     """The crops the app offers must be exactly the crops the model can name."""
     from app.grounding import knowledge_base
 
@@ -341,35 +391,29 @@ def test_knowledge_base_has_no_entries_outside_supported_crops() -> None:
         assert entry["cropId"] in knowledge_base.SUPPORTED_CROPS, entry["id"]
 
 
-def test_logs_top3_probabilities_and_applies_crop_scoped_confidence(
+def test_logs_top3_probabilities_and_crop_mass(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     import logging
 
     caplog.set_level(logging.INFO, logger="app.vision.classifier")
 
-    # Split-mass field photo: raw max is 0.354 (< 0.55), but potato classes hold 0.527
-    # so potato_early_blight has 0.354 / 0.527 = 0.672 within potato.
     split_probs = _probs(
         EFFICIENTNET,
         potato_early_blight=0.354,
         potato_late_blight=0.123,
         potato_healthy=0.050,
         rice_blast=0.166,
-        rice_other=0.139,
         rice_brown_spot=0.168,
     )
     potato_facts = _decide(split_probs, "potato", EFFICIENTNET)
-    assert potato_facts["status"] == "identified"
-    assert potato_facts["disease_id"] == "potato_early_blight"
-    assert potato_facts["confidence"] == pytest.approx(0.354 / 0.527, rel=1e-3)
+    # Raw 0.354 is below the 0.6 threshold, so this stays undetermined even
+    # though potato classes hold most of the mass.
+    assert potato_facts["status"] == "undetermined"
+    assert potato_facts["confidence"] == pytest.approx(0.354)
     assert any("vision top3 (efficientnet, crop=potato)" in r.message for r in caplog.records)
     assert any("potato_early_blight=0.354" in r.message for r in caplog.records)
+    assert any("crop_mass=0.527" in r.message for r in caplog.records)
 
-    # Same split distribution queried as rice has crop_top=rice_brown_spot (0.355 < 0.55) -> miss.
-    rice_facts = _decide(split_probs, "rice", EFFICIENTNET)
-    assert rice_facts["status"] == "undetermined"
-
-    # Truly uncertain / blurry uniform image (all 9 classes ~0.111, raw max < 0.35) -> miss.
     uniform_probs = np.full(len(EFFICIENTNET["labels"]), 1.0 / len(EFFICIENTNET["labels"]))
     assert _decide(uniform_probs, "potato", EFFICIENTNET)["status"] == "undetermined"

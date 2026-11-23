@@ -372,43 +372,5 @@
     "chemicals": [],
     "ppe_reminder_bn": "",
     "refer_to_officer": false
-  },
-  {
-    "chunk_id": "brri_dae_rice_other_01",
-    "disease_id": "rice_other",
-    "aliases": [
-      "other rice symptom",
-      "unknown rice",
-      "অন্যান্য ধানের সমস্যা"
-    ],
-    "crop_id": "rice",
-    "source_title": "BRRI ও DAE ফসল সুরক্ষা নির্দেশিকা",
-    "section": "আওতাবহির্ভূত লক্ষণ — অন্ধভাবে স্প্রে না করার নির্দেশনা",
-    "title_bn": "চিহ্নিত ৪টি রোগের বাইরের লক্ষণ: না বুঝে স্প্রে করবেন না",
-    "content_en": "BRRI & DAE Crop Protection Safety Protocol (Out-of-Scope Rice Symptom): The symptom does not match the 4 covered rice diseases (blast, bacterial leaf blight, brown spot, tungro). It could be a nutrient deficiency, insect damage, sheath blight, or photo blur. Do NOT spray any fungicide or pesticide blindly.",
-    "content_bn": "এই লক্ষণটি আমাদের আওতাভুক্ত ধানের প্রধান চারটি রোগের সাথে মিলছে না; এটি পুষ্টি ঘাটতি, অন্য কোনো পোকার আক্রমণ বা ছবির অস্পষ্টতার কারণে হতে পারে। তাই রোগ নিশ্চিত না হয়ে আন্দাজে কোনো ছত্রাকনাশক বা কীটনাশক স্প্রে করবেন না।",
-    "cultural_only": true,
-    "chemicals": [],
-    "ppe_reminder_bn": "",
-    "refer_to_officer": true
-  },
-  {
-    "chunk_id": "brri_dae_rice_other_02",
-    "disease_id": "rice_other",
-    "aliases": [
-      "other rice symptom",
-      "unknown rice",
-      "অন্যান্য ধানের সমস্যা"
-    ],
-    "crop_id": "rice",
-    "source_title": "BRRI ও DAE ফসল সুরক্ষা নির্দেশিকা",
-    "section": "পরিষ্কার ছবি ও উপ-সহকারী কৃষি কর্মকর্তার পরামর্শ",
-    "title_bn": "পরিষ্কার ছবি তুলুন এবং স্থানীয় উপ-সহকারী কৃষি কর্মকর্তাকে দেখান",
-    "content_en": "BRRI & DAE Safety Protocol (Clear Photo & SAAO Referral): Take a clearer close-up photo of an affected leaf in bright daylight and try again, or take a fresh plant sample directly to your local Sub-Assistant Agriculture Officer (SAAO) at the union/upazila agriculture office for accurate diagnosis.",
-    "content_bn": "রোগটি সঠিকভাবে বুঝতে দিনের ভালো আলোতে আক্রান্ত পাতার আরও পরিষ্কার কাছের ছবি তুলে আবার চেষ্টা করুন। পাশাপাশি চূড়ান্ত শনাক্তকরণ ও সঠিক পরামর্শের জন্য সরাসরি স্থানীয় উপ-সহকারী কৃষি কর্মকর্তা বা উপজেলা কৃষি অফিসে যোগাযোগ করুন।",
-    "cultural_only": true,
-    "chemicals": [],
-    "ppe_reminder_bn": "",
-    "refer_to_officer": true
   }
 ]
