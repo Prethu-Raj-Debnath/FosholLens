@@ -4,8 +4,7 @@ import { CropUploadCard } from '../components/CropUploadCard';
 export function HomePage() {
   return (
     <div className="page">
-      <h1 className="greeting">আসসালামু আলাইকুম 👋</h1>
-      <p className="greeting__subtitle">আপনার ফসলের ছবি দিয়ে রোগ শনাক্ত করুন।</p>
+      <h1 className="greeting">আপনার ফসলের ছবি দিয়ে রোগ শনাক্ত করুন।</h1>
 
       <div className="home-grid">
         <div className="hero">

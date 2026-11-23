@@ -8,7 +8,7 @@ Built for **CoU AI Hackathon 2026**.
 
 ## Team Tesseract
 
-- **Prethu Raj Debnath** (Leader)
+- **Prethu Raj Debnath**
 - **Md. Kawsar Amin**
 - **Nazim Saifullah** (`@nazimsaifullah`)
 

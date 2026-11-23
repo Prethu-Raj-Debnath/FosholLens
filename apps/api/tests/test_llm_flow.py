@@ -47,7 +47,7 @@ GOOD_SPOKEN = (
     "আপনার ধান গাছে সম্ভবত ব্লাস্ট রোগ হয়েছে। "
     "পাতায় ধূসর-সবুজ দাগ দেখা যাচ্ছে। "
     "ট্রাইসাইক্লাজল প্রতি লিটারে ০.৬ গ্রাম হিসেবে ব্যবহার করতে পারেন। "
-    "মনে রাখবেন, এটি একটি আনুমানিক পরামর্শ।"
+    "প্রয়োগের আগে স্থানীয় কৃষি কর্মকর্তার পরামর্শ নিন এবং গ্লাভস ও মাস্ক পরুন।"
 )
 
 
@@ -170,7 +170,7 @@ async def test_template_writer_needs_no_client() -> None:
     text, generated_by = await TemplateWriter().write(FACTS)
     assert generated_by == "template"
     assert "ট্রাইসাইক্লাজল" in text
-    assert "আনুমানিক" in text
+    assert "আনুমানিক পরামর্শ" not in text
 
 
 async def test_template_writer_mentions_weather_only_when_present() -> None:
@@ -373,7 +373,7 @@ async def test_gemini_retry_reuses_working_fallback_and_forbids_chemicals(monkey
     valid_unconfirmed_spoken = (
         "আপনার আলু গাছের ছবি থেকে রোগ নিশ্চিতভাবে বোঝা যায়নি। "
         "তাই আন্দাজে কোনো ছত্রাকনাশক বা ওষুধ স্প্রে করবেন না এবং স্থানীয় কৃষি কর্মকর্তার পরামর্শ নিন। "
-        "মনে রাখবেন, এটি একটি আনুমানিক পরামর্শ।"
+        "আরও পরিষ্কার ছবি তুলে আবার চেষ্টা করুন।"
     )
     writer, models = _gemini_writer_with(
         [

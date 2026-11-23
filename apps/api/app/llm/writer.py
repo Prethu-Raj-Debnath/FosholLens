@@ -156,7 +156,6 @@ SYSTEM_PROMPT = """\
   এবং স্থানীয় উপ-সহকারী কৃষি কর্মকর্তার পরামর্শ নিতে বলবে।
 - তথ্যে কৃষকের প্রশ্ন থাকলে শুধু দেওয়া বারি/ব্রি তথ্য ও আবহাওয়ার ভিত্তিতে
   সরাসরি সেই প্রশ্নের উত্তর বাংলায় দেবে; উত্তর দিতে গিয়ে কোনো নতুন ওষুধ বানাবে না।
-- শেষে সবসময় মনে করিয়ে দেবে যে এটি একটি আনুমানিক পরামর্শ।
 """
 
 DEFAULT_GEMINI_MODEL = "gemini-3.5-flash-lite"
@@ -520,8 +519,6 @@ class TemplateWriter:
                 safest = weather.get("safest_window_summary_bn")
                 if safest and not cultural_only and not uncertain:
                     parts.append(f"{safest}।")
-
-        parts.append("মনে রাখবেন, এটি একটি আনুমানিক পরামর্শ।")
 
         return normalise(" ".join(parts))
 

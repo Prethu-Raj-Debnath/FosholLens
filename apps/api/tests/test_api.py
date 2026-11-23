@@ -109,7 +109,8 @@ def test_full_pipeline_without_weather(client: TestClient) -> None:
     assert result["prevention"]
     # A farmer must never get a confident-sounding machine answer.
     assert result["needsProfessionalVerification"] is True
-    assert "আনুমানিক" in result["narrative"]
+    assert result["narrative"]
+    assert "আনুমানিক পরামর্শ" not in result["narrative"]
 
 
 def test_without_vision_the_result_says_so(client: TestClient) -> None:
@@ -349,7 +350,7 @@ def test_gemini_advisory_pipeline_conforms_to_contract(
     gemini_spoken = (
         "আপনার ধান গাছে ব্লাস্ট রোগের লক্ষণ দেখা যাচ্ছে। "
         "প্রাথমিকভাবে ট্রাইসাইক্লাজল স্প্রে করার আগে স্থানীয় কৃষি কর্মকর্তার পরামর্শ নিন। "
-        "স্প্রে করার সময় গ্লাভস ও মাস্ক পরুন এবং কাজ শেষে হাত ধুয়ে নিন। এটি একটি আনুমানিক পরামর্শ।"
+        "স্প্রে করার সময় গ্লাভস ও মাস্ক পরুন এবং কাজ শেষে হাত ধুয়ে নিন।"
     )
 
     async def fake_classify(self, image_path, crop_id):
@@ -397,7 +398,7 @@ def test_gemini_advisory_pipeline_conforms_to_contract(
     validated = AnalysisResult.model_validate(payload)
     assert validated.generatedBy == "llm"
     assert "ট্রাইসাইক্লাজল" in validated.narrative
-    assert "আনুমানিক পরামর্শ" in validated.narrative
+    assert "কৃষি কর্মকর্তার পরামর্শ" in validated.narrative
 
 
 def test_gemini_failure_falls_back_to_template_conforming_to_contract(
@@ -434,4 +435,4 @@ def test_gemini_failure_falls_back_to_template_conforming_to_contract(
     validated = AnalysisResult.model_validate(payload)
     assert validated.generatedBy == "template"
     assert validated.narrative
-    assert "আনুমানিক" in validated.narrative
+    assert "আনুমানিক পরামর্শ" not in validated.narrative
