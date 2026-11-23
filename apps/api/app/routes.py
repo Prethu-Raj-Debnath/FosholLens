@@ -33,8 +33,23 @@ router = APIRouter()
 
 MAX_UPLOAD_BYTES = 8 * 1024 * 1024
 ALLOWED_AUDIO_MIMES = frozenset(
-    {"audio/webm", "audio/ogg", "audio/mp4", "audio/mpeg", "audio/wav"}
+    {
+        "audio/webm",
+        "audio/ogg",
+        "audio/mp4",
+        "audio/mpeg",
+        "audio/wav",
+        "audio/aac",
+        "audio/x-m4a",
+        "audio/x-wav",
+        "video/mp4",
+        "video/webm",
+    }
 )
+_AUDIO_MIME_ALIASES: dict[str, str] = {
+    "audio/x-m4a": "audio/mp4",
+    "audio/x-wav": "audio/wav",
+}
 JPEG_QUALITY = 82
 MAX_IMAGE_EDGE = 1280
 
@@ -42,10 +57,11 @@ VERSION = "0.1.0"
 
 
 def _normalize_audio_mime(content_type: str | None) -> str:
-    """Strip codec parameters such as `;codecs=opus` and normalise case."""
+    """Strip codec parameters such as `;codecs=opus`, normalise case, and alias."""
     if not content_type:
         return ""
-    return content_type.split(";", 1)[0].strip().lower()
+    base = content_type.split(";", 1)[0].strip().lower()
+    return _AUDIO_MIME_ALIASES.get(base, base)
 
 
 def _clean_question_text(value: str | None) -> str | None:
@@ -141,6 +157,7 @@ async def create_analysis(
     if len(raw) > MAX_UPLOAD_BYTES:
         raise HTTPException(status_code=413, detail="image_too_large")
 
+    district = (district or "").strip() or None
     if district is not None and get_district(district) is None:
         raise HTTPException(status_code=400, detail="unknown_district")
 

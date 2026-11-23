@@ -151,7 +151,9 @@ def _classify_hour(
     return "green"
 
 
-def _build_timeline(hourly: dict[str, Any]) -> tuple[HourlySprayWindow, ...]:
+def _build_timeline(
+    hourly: dict[str, Any], *, start_hour: datetime | None = None
+) -> tuple[HourlySprayWindow, ...]:
     raw_probs: list[Any] = list(hourly.get("precipitation_probability") or [])[:TIMELINE_HOURS]
     raw_mms: list[Any] = list(hourly.get("precipitation") or [])[:TIMELINE_HOURS]
     raw_winds: list[Any] = list(hourly.get("wind_speed_10m") or [])[:TIMELINE_HOURS]
@@ -162,7 +164,7 @@ def _build_timeline(hourly: dict[str, Any]) -> tuple[HourlySprayWindow, ...]:
     if count == 0:
         return ()
 
-    base_dt = datetime(2026, 1, 1, 6, 0, tzinfo=_DHAKA_TZ)
+    base_dt = start_hour if start_hour is not None else _current_dhaka_hour()
     probs: list[int] = []
     mms: list[float] = []
     winds: list[float] = []
@@ -291,10 +293,15 @@ def _compute_safest_window_summary_bn(
     return f"সবচেয়ে নিরাপদ স্প্রে সময়: {day_bn} {start_bn} থেকে {end_bn}"
 
 
-def _slice_future_hourly(hourly: dict[str, Any], current_hour: datetime) -> dict[str, Any]:
-    raw_times = hourly.get("time")
-    if not raw_times:
+def _slice_future_hourly(
+    hourly: dict[str, Any], current_hour: datetime
+) -> dict[str, Any] | None:
+    if "time" not in hourly:
         return hourly
+
+    raw_times = hourly.get("time")
+    if not isinstance(raw_times, list) or not raw_times:
+        return None
 
     start_idx: int | None = None
     for idx, raw_time in enumerate(raw_times):
@@ -307,10 +314,7 @@ def _slice_future_hourly(hourly: dict[str, Any], current_hour: datetime) -> dict
             break
 
     if start_idx is None:
-        return {
-            key: ([] if isinstance(value, list) else value)
-            for key, value in hourly.items()
-        }
+        return None
 
     end_idx = start_idx + TIMELINE_HOURS
     return {
@@ -325,8 +329,12 @@ def classify(
     district_name: str,
     *,
     now: datetime | None = None,
-) -> WeatherFacts:
+) -> WeatherFacts | None:
     """Turn an Open-Meteo response into facts. Split out so it is testable."""
+    raw_hourly = payload.get("hourly") if isinstance(payload, dict) else None
+    if not isinstance(raw_hourly, dict) or not raw_hourly:
+        return None
+
     tz = _dhaka_tz()
     if now is None:
         current_hour = _current_dhaka_hour()
@@ -335,12 +343,18 @@ def classify(
     else:
         current_hour = now.astimezone(tz).replace(minute=0, second=0, microsecond=0)
 
-    hourly = _slice_future_hourly(payload["hourly"], current_hour)
+    hourly = _slice_future_hourly(raw_hourly, current_hour)
+    if hourly is None:
+        return None
+
     rain_series: list[int | None] = list(hourly.get("precipitation_probability") or [])[
         :HORIZON_HOURS
     ]
     wind_series: list[float | None] = list(hourly.get("wind_speed_10m") or [])[:HORIZON_HOURS]
     raw_humidity: list[int | None] = list(hourly.get(HUMIDITY_FIELD) or [])[:HORIZON_HOURS]
+    if not rain_series and not wind_series:
+        return None
+
     humidity_values = [h for h in raw_humidity if h is not None]
 
     # None means "model not confident"; treat a missing value as non-blocking
@@ -350,7 +364,7 @@ def classify(
     humidity = round(sum(humidity_values) / len(humidity_values)) if humidity_values else 0
 
     ok, reason = _decide(rain, wind)
-    windows = _build_timeline(hourly)
+    windows = _build_timeline(hourly, start_hour=current_hour)
     safest_summary = _compute_safest_window_summary_bn(
         windows, reference_date=current_hour.date()
     )
@@ -404,6 +418,10 @@ async def fetch_weather(
             exc.__class__.__name__,
             str(exc) or "no detail",
         )
+        return None
+
+    if facts is None:
+        log.warning("weather payload had no usable future hourly data for %s", district_id)
         return None
 
     for old_key in [k for k in _cache if k.startswith(f"{district_id}:") and k != cache_key]:

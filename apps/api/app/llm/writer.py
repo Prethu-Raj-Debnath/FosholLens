@@ -159,7 +159,7 @@ SYSTEM_PROMPT = """\
 - শেষে সবসময় মনে করিয়ে দেবে যে এটি একটি আনুমানিক পরামর্শ।
 """
 
-DEFAULT_GEMINI_MODEL = "gemini-3.8-flash"
+DEFAULT_GEMINI_MODEL = "gemini-3.5-flash-lite"
 FALLBACK_GEMINI_MODELS: tuple[str, ...] = (
     "gemini-3.8-flash",
     "gemini-3.7-flash",

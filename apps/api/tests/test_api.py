@@ -73,6 +73,10 @@ def test_health_reports_template_fallback(client: TestClient) -> None:
     assert body["vision"] == "unavailable"
     assert body["db"] == "ok"
 
+    root_health = client.get("/health")
+    assert root_health.status_code == 200
+    assert root_health.json() == body
+
 
 def test_districts_covers_all_64(client: TestClient) -> None:
     districts = client.get("/api/v1/districts").json()
@@ -270,6 +274,24 @@ def test_unknown_district_is_rejected(client: TestClient) -> None:
         data={"crop": "rice", "district": "atlantis"},
     )
     assert response.status_code == 400
+
+
+@pytest.mark.parametrize("blank_district", ["", "   "])
+def test_empty_district_is_normalized_to_none(client: TestClient, blank_district: str) -> None:
+    response = client.post(
+        "/api/v1/analyses",
+        files={"image": ("crop.jpg", _jpeg(), "image/jpeg")},
+        data={"crop": "rice", "district": blank_district},
+    )
+    assert response.status_code == 202
+    analysis_id = response.json()["id"]
+    summary = _wait(client, analysis_id)
+    assert summary["status"] == "completed"
+    assert summary["district"] is None
+
+    result = client.get(f"/api/v1/analyses/{analysis_id}/result").json()
+    assert result["district"] is None
+    assert result["weather"] is None
 
 
 def test_unreadable_image_is_rejected(client: TestClient) -> None:

@@ -10,7 +10,9 @@ Built for **CoU AI Hackathon 2026**.
 
 - **Prethu Raj Debnath** (Leader)
 - **Md. Kawsar Amin**
-- **Nazim Saifullah**
+- **Nazim Saifullah** (`@nazimsaifullah`)
+
+> **GitHub Contributor Transparency Note (Rule 3 / Rule 12):** Commits authored under `@niamt1` belong to a secondary GitHub account operated by registered Team Tesseract member **Nazim Saifullah** (`@nazimsaifullah`). All commits in this repository were authored solely by the three registered team members listed above.
 
 ---
 
@@ -25,7 +27,7 @@ Smallholder rice (*ধান*) and potato (*আলু*) farmers in Bangladesh fa
 2. **Optional Bangla Voice & Text Question Input** allowing farmers to record a 12-second Bangla voice question or type a question alongside their photo, transcribed natively via Google Gemini Flash audio understanding.
 3. **BARI/BRRI Grounded RAG Prescription Engine** (`18` curated chunks across all 9 leaf classes with precomputed Gemini embeddings + offline TF-IDF fallback), enforcing cultural-only guards for bacterial/viral diseases, no-spray healthy guidance, pre-harvest intervals (PHI), PPE reminders, and SAAO referrals.
 4. **48-Hour Color-Coded Spray Timeline & GPS Auto-District** using Open-Meteo hourly forecasts across all 64 districts of Bangladesh (with one-tap Haversine GPS district matching), deterministically computing safe (`green`), caution (`amber`), and wash-off/drift risk (`red`) hours plus a pure-Bangla safest daylight spray window.
-5. **Bangla Advisory Synthesis & Local Voice Playback** via Google Gemini Flash (with deterministic `TemplateWriter` fallback) and local ONNX Bangla TTS (`sulabhkatiyar/indic-tiny-tts-bengali` + `ffmpeg` -> Opus).
+5. **Bangla Advisory Synthesis & Local Voice Playback** via Google Gemini Flash (with deterministic `TemplateWriter` fallback) and local ONNX Bangla TTS (`sulabhkatiyar/indic-tiny-tts-bengali` + `ffmpeg` -> MP3 by default for iOS Safari/Android/Desktop compatibility, with WAV fallback when `ffmpeg` is absent).
 
 ---
 
@@ -42,21 +44,21 @@ The backend runs a 4-stage asynchronous job pipeline (`reading -> grounding -> w
      - `efficientnet` *(the shipped default model, committed at `apps/api/models/foshollens_leaf.onnx`, 16 MB, ~40 ms)*: EfficientNet-B0 across all 9 rice & potato classes (`potato_early_blight`, `potato_healthy`, `potato_late_blight`, `rice_bacterial_leaf_blight`, `rice_blast`, `rice_brown_spot`, `rice_healthy`, `rice_other`, and `rice_tungro`). Every disease and healthy label is surfaced to the farmer (`is_healthy` routes healthy plants to no-spray care); only `rice_other` stays non-diagnostic.
      - `vit` *(deprecated; opt in via `VISION_MODEL=vit`, `wambugu71/crop_leaf_diseases_vit_onnx`, 22 MB)*: ViT-tiny across 13 corn/potato/rice/wheat classes (its corn and wheat classes remain unsupported).
      - Threshold (`VISION_CONFIDENCE_THRESHOLD=0.55`) is checked on raw softmax probabilities before crop filtering.
-   - **Optional Bangla Voice/Text Question:** Accepts optional `question_text` (up to `300` chars) and `audio` (up to `5 MB`; `webm`, `ogg`, `mp4`, `mpeg`, `wav` with codec suffix stripping). `transcribe_bangla_question()` sends audio bytes natively to Gemini Flash (`types.Part.from_bytes`) and degrades cleanly to `None` if unconfigured or silent.
+   - **Optional Bangla Voice/Text Question:** Accepts optional `question_text` (up to `300` chars) and `audio` (up to `5 MB`; `audio/webm`, `audio/ogg`, `audio/mp4`, `audio/mpeg`, `audio/wav`, `audio/aac`, `audio/x-m4a`, `audio/x-wav`, `video/mp4`, `video/webm` with codec suffix stripping and MIME normalization). `transcribe_bangla_question()` sends audio bytes natively to Gemini Flash (`types.Part.from_bytes`) and degrades cleanly to `None` if unconfigured or silent.
 3. **Stage 2 — BARI/BRRI Hybrid RAG & 48-Hour Weather Guard (`apps/api/app/grounding/`):**
    - **BARI/BRRI Grounded RAG (`rag.py`, `knowledge_base.py`):** Retrieves grounded Bangla/English passages from the 18-chunk corpus (`apps/api/data/bari_brri_corpus.json`) ranked by hybrid cosine similarity over precomputed `gemini-embedding-001` vectors (`apps/api/data/bari_brri_index.json`) and zero-network TF-IDF fallback—prioritizing the farmer's voice/text question when present.
      - Marks `rice_bacterial_leaf_blight` and `rice_tungro` as `cultural_only=True` & `refer_to_officer=True` (explicitly warning that fungicides do not work).
      - Marks `potato_healthy` & `rice_healthy` as no-spray healthy confirmations.
-     - Marks `rice_other` as uncertain (`refer_to_officer=True`), advising against blind spraying.
-   - **48h Weather Spray Timeline (`weather.py`, `districts.py`):** Evaluates Open-Meteo `forecast_days=2` hourly rain probability, precipitation (`mm`), and wind speed (`km/h`):
+     - Marks `rice_other` and uncertain diagnoses across any crop as non-chemical (`cultural_only=True`, `refer_to_officer=True`), retrieving safe scouting/SAAO passages and advising against blind spraying.
+   - **48h Weather Spray Timeline (`weather.py`, `districts.py`):** Evaluates Open-Meteo `forecast_days=3` sliced to the upcoming 48 hours (`rainProb`, precipitation `mm`, wind speed `km/h`; returning `None` if hourly data is empty or expired):
      - `red` (unsafe): `rainProb >= 60%`, `rainMm >= 1.0`, `windKmh >= 15.0`, or heavy rain (`>= 60%` or `>= 1.0 mm`) within the next 3 hours (wash-off lookahead).
      - `amber` (caution): `rainProb >= 30%`, `rainMm > 0.0`, or `windKmh >= 10.0`.
      - `green` (safe): clear conditions, computing a pure-Bangla `safestWindowSummaryBn` for the earliest daylight (`06:00–18:00`) safe window.
 4. **Stage 3 — Grounded Bangla Advisory (`apps/api/app/llm/writer.py`):**
-   - **Primary:** Google Gemini Flash (`gemini-3.8-flash` with fallback to `gemini-3.7-flash` -> `gemini-3.5-flash` -> `gemini-3.5-flash-lite` on HTTP 404/429/503; optional `LLM_PROVIDER=openai` mode) synthesizes a 25–90 word colloquial Bangla advisory directly from retrieved BARI/BRRI passages, weather verdict, and farmer question.
+   - **Primary:** Google Gemini Flash (`gemini-3.5-flash-lite` default with fallback chain `gemini-3.8-flash` -> `gemini-3.7-flash` -> `gemini-3.5-flash` -> `gemini-3.5-flash-lite` -> `gemini-3.1-flash-lite` on HTTP 404/429/500/502/503/504 or timeout; optional `LLM_PROVIDER=openai` mode) synthesizes a 25–90 word colloquial Bangla advisory directly from retrieved BARI/BRRI passages, weather verdict, and farmer question.
    - **Safety Validation & Offline Fallback:** `validate_narrative()` rejects Latin letters, markdown, emojis, wrong word counts, or any chemical outside the retrieved BARI/BRRI chunks (blocking any chemicals when `cultural_only=True`). `TemplateWriter` composes grounded Bangla advice offline when no key is set or validation fails.
 5. **Stage 4 — Local Bangla Voice Playback (`apps/api/app/tts/engine.py`):**
-   - Synthesizes Bangla audio asynchronously via `sulabhkatiyar/indic-tiny-tts-bengali` (local ONNX, CPU) and transcodes via `ffmpeg` to compact Opus audio (`~22 KB/min`). `prepare_text()` repairs `/` dose ratios and verifies medicine names survive before audio is served.
+   - Synthesizes Bangla audio asynchronously via `sulabhkatiyar/indic-tiny-tts-bengali` (local ONNX, CPU) and transcodes via `ffmpeg` to compact MP3 audio (`TTS_FORMAT=mp3` default for universal iOS Safari/Android/Desktop playback; `opus` optional; WAV fallback if `ffmpeg` is unavailable). `prepare_text()` repairs `/` dose ratios and verifies medicine names survive before audio is served.
 
 ---
 
@@ -68,8 +70,8 @@ The backend runs a 4-stage asynchronous job pipeline (`reading -> grounding -> w
 - **Vision Models:**
   - Shipped EfficientNet-B0 ONNX checkpoint (`apps/api/models/foshollens_leaf.onnx`, 9 rice & potato classes) — default model
   - Deprecated opt-in fallback: Hugging Face Vision Transformer [`wambugu71/crop_leaf_diseases_vit`](https://huggingface.co/wambugu71/crop_leaf_diseases_vit) (`wambugu71/crop_leaf_diseases_vit_onnx`, 13 classes)
-- **Embeddings & LLM / Audio AI:** Google Gemini (`google-genai` SDK) — `gemini-embedding-001` for precomputed RAG embeddings and `gemini-3.8-flash` (with fallback chain) for Bangla voice transcription and advisory generation
-- **Text-to-Speech:** [`sulabhkatiyar/indic-tiny-tts-bengali`](https://huggingface.co/sulabhkatiyar/indic-tiny-tts-bengali) (local ONNX, CPU) + `ffmpeg` -> Opus/MP3
+- **Embeddings & LLM / Audio AI:** Google Gemini (`google-genai` SDK) — `gemini-embedding-001` for precomputed RAG embeddings and `gemini-3.5-flash-lite` (with fallback chain) for Bangla voice transcription and advisory generation
+- **Text-to-Speech:** [`sulabhkatiyar/indic-tiny-tts-bengali`](https://huggingface.co/sulabhkatiyar/indic-tiny-tts-bengali) (local ONNX, CPU) + `ffmpeg` -> MP3 (default) / Opus / WAV fallback
 - **Weather API:** [Open-Meteo Forecast API](https://open-meteo.com/) (key-free, non-commercial use)
 - **Datasets & Agricultural Knowledge Sources:**
   - PlantVillage Dataset (Potato leaf diseases) & Paddy Doctor Dataset (Rice leaf diseases)
@@ -83,7 +85,7 @@ The backend runs a 4-stage asynchronous job pipeline (`reading -> grounding -> w
 In accordance with **CoU AI Hackathon 2026 Rule 10**, Team Tesseract discloses the AI tools used in building FosholLens:
 - **Antigravity:** Codebase exploration, feature implementation, refactoring, RAG/voice/timeline wiring, test execution, and build verification.
 - **Claude (Anthropic):** System architecture design, safety guard review (Latin-script TTS checks, cultural-only chemical blocking, wash-off lookahead rules), and documentation structure.
-- **Google Gemini:** Prompt engineering for Bangla agricultural advisory & voice transcription, precomputing `gemini-embedding-001` corpus vectors, and runtime `gemini-3.8-flash` inference.
+- **Google Gemini:** Prompt engineering for Bangla agricultural advisory & voice transcription, precomputing `gemini-embedding-001` corpus vectors, and runtime `gemini-3.5-flash-lite` inference (with Flash fallback chain).
 
 ---
 
@@ -105,11 +107,11 @@ In accordance with **CoU AI Hackathon 2026 Rule 10**, Team Tesseract discloses t
 foshollens/
 ├── apps/
 │   ├── api/                           # Python 3.12+ / FastAPI service
-│   │   ├── Dockerfile                 # Production container for Hugging Face Spaces (port 7860, UID 1000)
+│   │   ├── Dockerfile                 # Production container for Azure Container Apps (port 7860, HEALTHCHECK, UID 1000)
 │   │   ├── .dockerignore
 │   │   ├── pyproject.toml
 │   │   ├── app/
-│   │   │   ├── main.py                # FastAPI app, CORS, lifespan startup checks
+│   │   │   ├── main.py                # FastAPI app, CORS, /health alias, lifespan startup checks
 │   │   │   ├── routes.py              # /api/v1 health, districts, crops, analyses, image, audio
 │   │   │   ├── contracts.py           # Pydantic API contracts (source of truth)
 │   │   │   ├── config.py              # Environment settings (.env & apps/api/.env)
@@ -124,7 +126,7 @@ foshollens/
 │   │   │   ├── llm/
 │   │   │   │   ├── writer.py          # Gemini Flash + OpenAI-compat + validator + Template fallback
 │   │   │   │   └── audio_input.py     # Gemini Flash native Bangla audio question transcription
-│   │   │   └── tts/engine.py          # indic-tiny-tts-bengali ONNX + ffmpeg Opus encoder
+│   │   │   └── tts/engine.py          # indic-tiny-tts-bengali ONNX + ffmpeg MP3/Opus encoder
 │   │   ├── data/
 │   │   │   ├── bari_brri_corpus.json  # 18-chunk curated 9-class BARI/BRRI/DAE knowledge corpus
 │   │   │   └── bari_brri_index.json   # Precomputed 768-dim Gemini embeddings
@@ -132,9 +134,9 @@ foshollens/
 │   │   │   └── foshollens_leaf.onnx   # Committed 9-class EfficientNet-B0 ONNX checkpoint (16 MB)
 │   │   ├── scripts/
 │   │   │   └── build_rag_index.py     # Rebuilds bari_brri_index.json via gemini-embedding-001
-│   │   └── tests/                     # 142+ pytest tests (API, RAG, voice, weather, vision, TTS, CORS)
+│   │   └── tests/                     # pytest tests (API, RAG, voice, weather, vision, TTS, CORS)
 │   └── frontend/                      # @foshol-lens/frontend (React 19 + TypeScript + Vite PWA)
-│       ├── vercel.json                # SPA rewrite for Vercel direct route refreshes
+│       ├── vercel.json                # Standalone SPA rewrite config
 │       ├── index.html
 │       ├── public/
 │       │   ├── favicon.svg
@@ -152,6 +154,7 @@ foshollens/
 ├── .env.example
 ├── .gitignore
 ├── package.json
+├── vercel.json                        # Root Vercel monorepo build & SPA rewrite config
 └── README.md
 ```
 
@@ -162,7 +165,7 @@ foshollens/
 ### Prerequisites
 - **Node.js** `>= 22` and `npm`
 - **Python 3.12** (recommended via [`uv`](https://docs.astral.sh/uv/))
-- **`ffmpeg`** on `PATH` (optional, required for Bangla Opus/MP3 TTS audio output)
+- **`ffmpeg`** on `PATH` (optional, required for Bangla MP3/Opus TTS audio output; falls back to WAV when absent)
 
 ### 1. Environment Variables
 Copy `.env.example` to `.env` in the repo root (or `apps/api/.env`). Never commit `.env`:
@@ -227,20 +230,22 @@ npm run typecheck
 
 ## Deployment
 
-### Backend on Hugging Face Spaces (Docker)
-1. Create a new **Docker** Space (CPU Basic 2 vCPU / 16 GB RAM is sufficient for ONNX vision + local TTS).
-2. Point the Space build context to `apps/api` (using [`apps/api/Dockerfile`](apps/api/Dockerfile), which installs `ffmpeg`, copies `models/foshollens_leaf.onnx` & `data/`, runs as UID `1000`, and serves Uvicorn on `0.0.0.0:${PORT:-7860}`).
-3. Configure Space Secrets / Variables:
+### Backend on Azure Container Apps (Docker)
+1. Build and push [`apps/api/Dockerfile`](apps/api/Dockerfile) using build context `apps/api` (installs `ffmpeg`, copies `models/foshollens_leaf.onnx` & `data/`, runs as UID `1000`, exposes port `7860` with a built-in Docker `HEALTHCHECK` on `/api/v1/health`, and starts Uvicorn on `0.0.0.0:${PORT:-7860}`; `/health` is also exposed as a root alias).
+2. Configure the Container App with:
+   - **External Ingress Target Port:** `7860`
+   - **Scaling:** `minReplicas=1` (or `0`) and **`maxReplicas=1`** — required so all requests share a single SQLite (WAL) database and local `/app/storage` volume safely.
+   - **Resources:** `1.0 vCPU` / `2.0 Gi` RAM (or `2.0 vCPU` / `4.0 Gi` RAM) for CPU ONNX vision + local TTS synthesis.
+3. Configure Container App Environment Variables / Secrets:
    - `APP_ENV=production`
    - `GEMINI_API_KEY=<your-gemini-api-key>`
    - `CORS_ORIGINS=http://localhost:5173,https://<your-vercel-domain>.vercel.app`
-   - `PUBLIC_BASE_URL=https://<your-space-url>.hf.space`
+   - `PUBLIC_BASE_URL=https://<your-container-app-fqdn>`
 
 ### Frontend on Vercel
-1. Import the repository into Vercel with **Root Directory** set to `apps/frontend` (or build from root via `npm run build --workspace @foshol-lens/contracts && npm run build --workspace @foshol-lens/frontend` with output directory `apps/frontend/dist`).
-2. [`apps/frontend/vercel.json`](apps/frontend/vercel.json) handles SPA route rewrites (`/analysis/:id`, `/history`).
-3. Set Vercel environment variable:
-   - `VITE_API_BASE_URL=https://<your-space-url>.hf.space`
+1. Import the repository into Vercel with the **Root Directory** left at the repository root (`.`). Root [`vercel.json`](vercel.json) runs `npm ci`, builds `@foshol-lens/contracts` and `@foshol-lens/frontend`, serves `apps/frontend/dist`, and rewrites SPA routes (`/analysis/:id`, `/history`).
+2. Set the Vercel environment variable:
+   - `VITE_API_BASE_URL=https://<your-container-app-fqdn>`
 
 ---
 

@@ -80,3 +80,21 @@ def test_cors_origins_env_accepts_comma_separated_production_urls(
 
         blocked = _preflight(prod_client, "http://localhost:5174")
         assert "access-control-allow-origin" not in blocked.headers
+
+
+def test_wildcard_cors_disables_allow_credentials(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    storage = tmp_path / "storage"
+    monkeypatch.setattr(settings, "database_path", storage / "test.db")
+    monkeypatch.setattr(settings, "storage_dir", storage)
+    monkeypatch.setattr(settings, "app_env", "production")
+    monkeypatch.setattr(settings, "cors_origin", "*")
+    for directory in (settings.images_dir, settings.audio_dir):
+        directory.mkdir(parents=True, exist_ok=True)
+
+    with TestClient(create_app()) as wildcard_client:
+        response = _preflight(wildcard_client, "https://example.com")
+        assert response.status_code == 200
+        assert response.headers.get("access-control-allow-origin") == "*"
+        assert response.headers.get("access-control-allow-credentials") != "true"

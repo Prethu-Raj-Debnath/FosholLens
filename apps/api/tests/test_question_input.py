@@ -130,6 +130,11 @@ def test_question_text_blank_and_max_length_trimming(client: TestClient) -> None
         "audio/mp4",
         "audio/mpeg",
         "audio/wav",
+        "audio/aac",
+        "audio/x-m4a",
+        "audio/x-wav",
+        "video/mp4",
+        "video/webm",
     ],
 )
 def test_supported_audio_mimes_accepted_and_degrade_without_key(
@@ -274,3 +279,50 @@ def test_voice_and_text_combined_question_flows_into_pipeline(
     payload = client.get(f"/api/v1/analyses/{analysis_id}/result").json()
     result = AnalysisResult.model_validate(payload)
     assert result.farmerQuestion == "পাতায় দাগ দেখা যাচ্ছে। কোন সার দেব?"
+
+
+@pytest.mark.parametrize(
+    ("uploaded_mime", "expected_gemini_mime"),
+    [
+        ("audio/x-m4a", "audio/mp4"),
+        ("audio/x-m4a; codecs=mp4a.40.2", "audio/mp4"),
+        ("audio/x-wav", "audio/wav"),
+    ],
+)
+def test_audio_mime_aliases_normalize_before_gemini_part_from_bytes(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+    uploaded_mime: str,
+    expected_gemini_mime: str,
+) -> None:
+    calls: list[dict] = []
+
+    class StubModels:
+        def generate_content(self, **kwargs):
+            calls.append(kwargs)
+            return SimpleNamespace(text="আলুর পাতায় দাগ কেন?")
+
+    monkeypatch.setattr(settings, "gemini_api_key", "test-key-not-real")
+    monkeypatch.setattr(
+        audio_input, "_build_client", lambda *_args: SimpleNamespace(models=StubModels())
+    )
+    monkeypatch.setattr("app.jobs.pipeline.get_writer", lambda: TemplateWriter())
+    monkeypatch.setattr(rag, "_embed_query", lambda *_args: None)
+
+    created = client.post(
+        "/api/v1/analyses",
+        files={
+            "image": ("crop.jpg", _jpeg(), "image/jpeg"),
+            "audio": ("voice.m4a", b"fake-audio-payload", uploaded_mime),
+        },
+        data={"crop": "potato"},
+    )
+    assert created.status_code == 202
+    analysis_id = created.json()["id"]
+    summary = _wait(client, analysis_id)
+    assert summary["status"] == "completed"
+
+    assert len(calls) == 1
+    audio_part = calls[0]["contents"][1]
+    assert audio_part.inline_data.mime_type == expected_gemini_mime
+    assert audio_part.inline_data.data == b"fake-audio-payload"

@@ -173,16 +173,20 @@ async def _pipeline(
             district_name=str(district["name"]),
         )
 
-    query_parts = [disease["diseaseLabel"], disease["bnName"]]
+    rag_disease_id = (
+        disease["id"] if confirmed or disease["id"] == "rice_other" else "uncertain"
+    )
     if confirmed:
-        query_parts.extend(disease["symptoms"][:2])
+        query_parts = [disease["diseaseLabel"], disease["bnName"], *disease["symptoms"][:2]]
+    else:
+        query_parts = [disease["cropName"], "scouting", "SAAO", "clear photo"]
     if weather is not None and not weather.spray_window_ok:
         query_parts.append("rain wind spray warning")
     rag_query = farmer_question if farmer_question else " ".join(query_parts)
 
     grounding = await asyncio.to_thread(
         rag.retrieve_grounding_bundle,
-        disease["id"],
+        rag_disease_id,
         disease["cropId"],
         rag_query,
         3,

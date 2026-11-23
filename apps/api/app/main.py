@@ -11,7 +11,8 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from . import store
 from .config import settings
-from .routes import router
+from .contracts import HealthResponse
+from .routes import health, router
 from .vision.classifier import get_classifier, missing_weights
 
 logging.basicConfig(
@@ -83,11 +84,12 @@ def create_app() -> FastAPI:
         CORSMiddleware,
         allow_origins=settings.cors_origins,
         allow_origin_regex=dev_origin_regex if settings.is_development else None,
-        allow_credentials=True,
+        allow_credentials="*" not in settings.cors_origins,
         allow_methods=["*"],
         allow_headers=["*"],
     )
 
+    app.add_api_route("/health", health, methods=["GET"], response_model=HealthResponse)
     app.include_router(router, prefix=API_PREFIX)
     return app
 

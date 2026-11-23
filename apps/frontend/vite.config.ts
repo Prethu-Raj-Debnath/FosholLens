@@ -1,7 +1,7 @@
 import { defineConfig } from 'vite';
 import react from '@vitejs/plugin-react';
 
-// Backend origin used by the dev proxy (/api -> Express server).
+// Backend origin used by the dev proxy (/api -> FastAPI server).
 const apiTarget = process.env.VITE_API_BASE_URL ?? 'http://localhost:4000';
 
 export default defineConfig({
@@ -17,6 +17,6 @@ export default defineConfig({
   },
   build: {
     outDir: 'dist',
-    sourcemap: true,
+    sourcemap: false,
   },
 });

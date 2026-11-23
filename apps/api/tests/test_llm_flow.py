@@ -285,7 +285,15 @@ async def test_gemini_good_output_is_accepted(monkeypatch) -> None:
 
     assert generated_by == "llm"
     assert "ট্রাইসাইক্লাজল" in text
-    assert models.calls[0]["model"] == "gemini-3.8-flash"
+    assert models.calls[0]["model"] == "gemini-3.5-flash-lite"
+
+
+def test_settings_defaults_use_flash_lite_and_mp3() -> None:
+    from app.config import Settings
+
+    defaults = Settings(_env_file=None)
+    assert defaults.gemini_model == "gemini-3.5-flash-lite"
+    assert defaults.tts_format == "mp3"
 
 
 async def test_gemini_fallback_models_on_retryable_status_codes(monkeypatch) -> None:

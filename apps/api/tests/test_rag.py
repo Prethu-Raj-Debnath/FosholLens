@@ -424,3 +424,72 @@ def test_unconfirmed_potato_hides_chemical_rag_prose_and_sources(
         farmer_question=question,
     )
     assert [s["chunkId"] for s in result["ragSources"]] == ["bari_potato_late_blight_01"]
+
+
+def test_uncertain_rag_fallback_for_rice_potato_and_unknown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(settings, "gemini_api_key", "")
+    monkeypatch.setattr(settings, "llm_api_key", "")
+    rag.reset_rag_cache()
+
+    rice_bundle = rag.retrieve_grounding_bundle("uncertain", "rice", "ধানের পাতায় দাগ", top_k=3)
+    assert rice_bundle.normalized_disease_id == "rice_other"
+    assert rice_bundle.cultural_only is True
+    assert rice_bundle.refer_to_officer is True
+    assert rice_bundle.chemicals == []
+    assert [s.disease_id for s in rice_bundle.sources] == ["rice_other", "rice_other"]
+
+    for query in (None, "আমার আলুর পাতায় দাগ, কোন ছত্রাকনাশক স্প্রে করব?"):
+        potato_bundle = rag.retrieve_grounding_bundle("uncertain", "potato", query, top_k=3)
+        assert potato_bundle.normalized_disease_id == "uncertain"
+        assert potato_bundle.cultural_only is True
+        assert potato_bundle.refer_to_officer is True
+        assert potato_bundle.chemicals == []
+        assert potato_bundle.sources
+        chunk_ids = [s.chunk_id for s in potato_bundle.sources]
+        assert "brri_dae_rice_other_02" in chunk_ids
+        assert all("blight" not in s.disease_id for s in potato_bundle.sources)
+        assert "bari_potato_healthy_01" not in chunk_ids
+
+    unknown_bundle = rag.retrieve_grounding_bundle("uncertain", "unknown", None, top_k=3)
+    assert unknown_bundle.normalized_disease_id == "uncertain"
+    assert unknown_bundle.cultural_only is True
+    assert unknown_bundle.refer_to_officer is True
+    assert unknown_bundle.chemicals == []
+    assert [s.chunk_id for s in unknown_bundle.sources] == ["brri_dae_rice_other_02"]
+
+
+def test_pipeline_unconfirmed_rice_uses_rice_other_rag_sources(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    storage = tmp_path / "storage"
+    monkeypatch.setattr(settings, "database_path", storage / "test.db")
+    monkeypatch.setattr(settings, "storage_dir", storage)
+    monkeypatch.setattr(settings, "tts_enabled", False)
+    monkeypatch.setattr(settings, "vision_enabled", False)
+    monkeypatch.setattr(settings, "gemini_api_key", "")
+    monkeypatch.setattr(settings, "llm_api_key", "")
+    reset_writer()
+    rag.reset_rag_cache()
+
+    for directory in (settings.images_dir, settings.audio_dir):
+        directory.mkdir(parents=True, exist_ok=True)
+
+    with TestClient(app) as client:
+        created = client.post(
+            "/api/v1/analyses",
+            files={"image": ("crop.jpg", _jpeg(), "image/jpeg")},
+            data={"crop": "rice"},
+        )
+        assert created.status_code == 202
+        analysis_id = created.json()["id"]
+        _wait(client, analysis_id)
+
+        payload = client.get(f"/api/v1/analyses/{analysis_id}/result").json()
+        result = AnalysisResult.model_validate(payload)
+        assert result.uncertainty.isUncertain is True
+        assert result.referToOfficer is True
+        assert result.ppeReminder is None
+        assert len(result.ragSources) >= 1
+        assert all(src.diseaseId == "rice_other" for src in result.ragSources)

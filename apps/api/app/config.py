@@ -35,7 +35,7 @@ class Settings(BaseSettings):
     # ---- LLM (optional: without a key the template writer is used) ----
     llm_provider: Literal["auto", "gemini", "openai"] = "auto"
     gemini_api_key: str = ""
-    gemini_model: str = "gemini-3.8-flash"
+    gemini_model: str = "gemini-3.5-flash-lite"
     llm_base_url: str = "https://tokens.bd/v1"
     llm_api_key: str = ""
     llm_model: str = "openai/gpt-6-luna"
@@ -65,7 +65,7 @@ class Settings(BaseSettings):
     tts_enabled: bool = True
     tts_model_id: str = "sulabhkatiyar/indic-tiny-tts-bengali"
     tts_voice: Literal["female", "male"] = "female"
-    tts_format: Literal["opus", "mp3"] = "opus"
+    tts_format: Literal["opus", "mp3"] = "mp3"
     ffmpeg_path: str = "ffmpeg"
 
     # ---- weather ------------------------------------------------------

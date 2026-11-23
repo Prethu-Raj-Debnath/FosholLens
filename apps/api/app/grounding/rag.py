@@ -382,6 +382,44 @@ def _select_candidates(norm_disease: str, norm_crop: str, corpus: list[RagChunk]
     return []
 
 
+def _safe_fallback_candidates(norm_crop: str, corpus: list[RagChunk]) -> list[RagChunk]:
+    """Return safe non-chemical/scouting/SAAO passages for uncertain diagnoses."""
+    if norm_crop == "rice":
+        rice_other = [chunk for chunk in corpus if chunk["disease_id"] == "rice_other"]
+        if rice_other:
+            return rice_other
+
+    if norm_crop == "potato":
+        potato_safe = [
+            chunk
+            for cid in ("brri_dae_rice_other_02", "bari_potato_healthy_02")
+            for chunk in corpus
+            if chunk["chunk_id"] == cid
+        ]
+        if potato_safe:
+            return potato_safe
+
+    saao_photo = [chunk for chunk in corpus if chunk["chunk_id"] == "brri_dae_rice_other_02"]
+    if saao_photo:
+        return saao_photo
+
+    officer_cultural = [
+        chunk
+        for chunk in corpus
+        if chunk.get("cultural_only")
+        and chunk.get("refer_to_officer")
+        and not chunk.get("chemicals")
+    ]
+    if officer_cultural:
+        return officer_cultural
+
+    return [
+        chunk
+        for chunk in corpus
+        if chunk.get("cultural_only") and not chunk.get("chemicals")
+    ]
+
+
 def retrieve_grounding_bundle(
     disease_id: str,
     crop_id: str,
@@ -405,13 +443,12 @@ def retrieve_grounding_bundle(
     norm_disease = normalize_disease_id(disease_id)
     norm_crop = _normalize_crop_id(crop_id)
 
-    candidates = _select_candidates(norm_disease, norm_crop, corpus)
-    if not candidates and norm_crop == "potato" and query_text and query_text.strip():
-        potato_chunks = [chunk for chunk in corpus if chunk["crop_id"] == "potato"]
-        tfidf = _tfidf_scores(query_text, potato_chunks)
-        candidates = [
-            chunk for chunk in potato_chunks if tfidf.get(chunk["chunk_id"], 0.0) > 0.0
-        ]
+    if norm_disease == "uncertain":
+        candidates = _safe_fallback_candidates(norm_crop, corpus)
+    else:
+        candidates = _select_candidates(norm_disease, norm_crop, corpus)
+        if not candidates:
+            candidates = _safe_fallback_candidates(norm_crop, corpus)
 
     selected = _rank_candidates(candidates, query_text)[:top_k]
 
@@ -464,7 +501,10 @@ def retrieve_grounding_bundle(
         for chunk in selected
     ]
 
-    resolved_id = selected[0]["disease_id"] if selected else norm_disease
+    if norm_disease == "uncertain":
+        resolved_id = "rice_other" if norm_crop == "rice" else "uncertain"
+    else:
+        resolved_id = selected[0]["disease_id"] if selected else norm_disease
     return GroundingBundle(
         normalized_disease_id=resolved_id,
         sources=sources,

@@ -189,6 +189,11 @@ export function CropUploadCard() {
       return;
     }
 
+    if (!window.isSecureContext) {
+      setMicNote('ভয়েস রেকর্ডিংয়ের জন্য নিরাপদ (HTTPS) সংযোগ প্রয়োজন; নিচে লিখে প্রশ্ন করুন।');
+      return;
+    }
+
     if (
       typeof MediaRecorder === 'undefined' ||
       !navigator.mediaDevices ||
@@ -212,20 +217,30 @@ export function CropUploadCard() {
       mediaRecorderRef.current = recorder;
 
       const chunks: BlobPart[] = [];
+      let hadRecorderError = false;
       recorder.ondataavailable = (event) => {
         if (event.data.size > 0) chunks.push(event.data);
+      };
+      recorder.onerror = () => {
+        hadRecorderError = true;
+        stopStream();
+        setRecording(false);
+        setMicNote('ভয়েস রেকর্ডিংয়ে সমস্যা হয়েছে; আবার চেষ্টা করুন অথবা নিচে লিখে প্রশ্ন করুন।');
       };
       recorder.onstop = () => {
         stopStream();
         setRecording(false);
+        if (hadRecorderError) return;
         const finalType = recorder.mimeType || mimeType || 'audio/webm';
         const recorded = new Blob(chunks, { type: finalType });
-        if (recorded.size > 0) {
-          const url = URL.createObjectURL(recorded);
-          audioPreviewRef.current = url;
-          setAudioBlob(recorded);
-          setAudioPreviewUrl(url);
+        if (recorded.size === 0) {
+          setMicNote('কোনো অডিও রেকর্ড হয়নি; আবার চেষ্টা করুন অথবা নিচে লিখে প্রশ্ন করুন।');
+          return;
         }
+        const url = URL.createObjectURL(recorded);
+        audioPreviewRef.current = url;
+        setAudioBlob(recorded);
+        setAudioPreviewUrl(url);
       };
 
       recorder.start();
@@ -240,10 +255,20 @@ export function CropUploadCard() {
           mediaRecorderRef.current.stop();
         }
       }, 250);
-    } catch {
+    } catch (error) {
       stopStream();
       setRecording(false);
-      setMicNote('মাইক্রোফোন ব্যবহারের অনুমতি পাওয়া যায়নি; নিচে লিখে প্রশ্ন করুন।');
+      const errorName =
+        error instanceof DOMException || error instanceof Error ? error.name : '';
+      if (errorName === 'NotAllowedError' || errorName === 'PermissionDeniedError') {
+        setMicNote(
+          'মাইক্রোফোন ব্যবহারের অনুমতি দেওয়া হয়নি; ব্রাউজার সেটিংস থেকে অনুমতি দিন অথবা নিচে লিখে প্রশ্ন করুন।',
+        );
+      } else if (errorName === 'NotFoundError' || errorName === 'DevicesNotFoundError') {
+        setMicNote('কোনো মাইক্রোফোন পাওয়া যায়নি; নিচে লিখে প্রশ্ন করুন।');
+      } else {
+        setMicNote('মাইক্রোফোন চালু করা যায়নি; আবার চেষ্টা করুন অথবা নিচে লিখে প্রশ্ন করুন।');
+      }
     }
   }
 

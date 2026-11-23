@@ -395,3 +395,93 @@ async def test_fetch_weather_requests_three_forecast_days(
     assert len(facts.hourly_windows) == 48
     first_dt = weather_module._parse_dhaka_dt(facts.hourly_windows[0].time_iso)
     assert first_dt >= weather_module._current_dhaka_hour()
+
+
+def test_classify_returns_none_for_missing_empty_or_expired_hourly() -> None:
+    now = datetime(2026, 11, 23, 12, 0, tzinfo=_DHAKA_TZ)
+    assert classify({}, "dhaka", "ঢাকা", now=now) is None
+    assert classify({"hourly": None}, "dhaka", "ঢাকা", now=now) is None
+    assert classify({"hourly": {}}, "dhaka", "ঢাকা", now=now) is None
+    assert (
+        classify(
+            {
+                "hourly": {
+                    "time": [],
+                    "precipitation_probability": [],
+                    "wind_speed_10m": [],
+                    "relative_humidity_2m": [],
+                }
+            },
+            "dhaka",
+            "ঢাকা",
+            now=now,
+        )
+        is None
+    )
+
+    expired_payload = _make_48h_payload(start=now - timedelta(hours=48), hours=24)
+    assert classify(expired_payload, "dhaka", "ঢাকা", now=now) is None
+
+
+async def test_fetch_weather_returns_none_on_empty_hourly_and_does_not_cache(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.grounding import weather as weather_module
+
+    weather_module._cache.clear()
+    payloads = [
+        {"hourly": {"time": [], "precipitation_probability": [], "wind_speed_10m": []}},
+        _make_48h_payload(
+            start=datetime.now(_DHAKA_TZ).replace(minute=0, second=0, microsecond=0),
+            hours=48,
+        ),
+    ]
+
+    class FakeResponse:
+        def __init__(self, payload: dict) -> None:
+            self._payload = payload
+
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict:
+            return self._payload
+
+    class FakeClient:
+        def __init__(self, **_kwargs) -> None:
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args) -> None:
+            return None
+
+        async def get(self, _url: str, params: dict) -> FakeResponse:
+            return FakeResponse(payloads.pop(0))
+
+    monkeypatch.setattr(weather_module.httpx, "AsyncClient", FakeClient)
+
+    first = await weather_module.fetch_weather(23.8103, 90.4125, "dhaka", "ঢাকা")
+    assert first is None
+
+    second = await weather_module.fetch_weather(23.8103, 90.4125, "dhaka", "ঢাকা")
+    assert second is not None
+    assert len(second.hourly_windows) == 48
+
+
+def test_synthetic_payload_without_time_never_uses_2026_01_01() -> None:
+    now = datetime(2026, 11, 23, 14, 0, tzinfo=_DHAKA_TZ)
+    payload = {
+        "hourly": {
+            "precipitation_probability": [10] * 12,
+            "precipitation": [0.0] * 12,
+            "wind_speed_10m": [5.0] * 12,
+            "relative_humidity_2m": [70] * 12,
+        }
+    }
+    facts = classify(payload, "dhaka", "ঢাকা", now=now)
+    assert facts is not None
+    assert len(facts.hourly_windows) == 12
+    assert not any(w.time_iso.startswith("2026-01-01") for w in facts.hourly_windows)
+    assert facts.hourly_windows[0].time_iso.startswith("2026-11-23T14:00")
