@@ -1650,3 +1650,107 @@ ul {
   color: var(--ink-body);
   font-weight: 600;
 }
+
+/* ------------------------------------------- GPS badge & card voice UI -- */
+
+.gps-badge {
+  display: inline-flex;
+  margin-top: 6px;
+  padding: 2px 10px;
+  align-items: center;
+  border-radius: 999px;
+  background: var(--green-100);
+  color: var(--green-800);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.card__header-row {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
+.speak-btn-wrap {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 5px;
+}
+
+.speak-btn {
+  display: inline-flex;
+  padding: 5px 12px;
+  align-items: center;
+  gap: 6px;
+  border: 1px solid var(--border-strong);
+  border-radius: 999px;
+  background: var(--surface);
+  color: var(--green-800);
+  font-size: 12.5px;
+  font-weight: 700;
+  line-height: 1.4;
+  transition:
+    background-color 150ms ease,
+    border-color 150ms ease;
+}
+
+.speak-btn:hover:not(:disabled) {
+  border-color: var(--green-600);
+  background: var(--green-50);
+}
+
+.speak-btn:disabled {
+  opacity: 0.75;
+  cursor: wait;
+}
+
+.speak-btn--playing {
+  border-color: var(--green-700);
+  background: var(--green-700);
+  color: #fff;
+}
+
+.speak-btn--playing:hover:not(:disabled) {
+  border-color: var(--green-800);
+  background: var(--green-800);
+}
+
+.speak-btn__spinner {
+  width: 13px;
+  height: 13px;
+  border-width: 2px;
+}
+
+.speak-btn__error {
+  display: inline-flex;
+  padding: 4px 8px;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  border: 1px solid var(--error-border);
+  border-radius: var(--radius-sm);
+  background: var(--error-bg);
+  color: var(--error-ink);
+  font-size: 11.5px;
+  font-weight: 600;
+}
+
+.speak-btn__retry {
+  display: inline-flex;
+  padding: 2px 7px;
+  align-items: center;
+  gap: 4px;
+  border: 1px solid var(--error-border);
+  border-radius: 999px;
+  background: var(--surface);
+  color: var(--error-ink);
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.speak-btn__retry:hover {
+  background: var(--surface-hover);
+}

@@ -9,6 +9,7 @@ spray is washed off or wasted.
 from __future__ import annotations
 
 import logging
+import math
 import time
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone, tzinfo
@@ -18,6 +19,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 import httpx
 
 from ..config import settings
+from .districts import find_nearest_district, get_district
 
 log = logging.getLogger(__name__)
 
@@ -62,6 +64,7 @@ def _parse_dhaka_dt(raw: str) -> datetime:
     return parsed.astimezone(tz)
 
 SpraySafety = Literal["green", "amber", "red"]
+LocationSource = Literal["gps", "district"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -93,6 +96,7 @@ class WeatherFacts:
     reason: str
     hourly_windows: tuple[HourlySprayWindow, ...] = ()
     safest_window_summary_bn: str | None = None
+    location_source: LocationSource = "district"
 
     def as_prompt_facts(self) -> dict[str, Any]:
         """The shape handed to the LLM. Facts only, no instructions."""
@@ -329,6 +333,7 @@ def classify(
     district_name: str,
     *,
     now: datetime | None = None,
+    location_source: LocationSource = "district",
 ) -> WeatherFacts | None:
     """Turn an Open-Meteo response into facts. Split out so it is testable."""
     raw_hourly = payload.get("hourly") if isinstance(payload, dict) else None
@@ -379,26 +384,78 @@ def classify(
         reason=reason,
         hourly_windows=windows,
         safest_window_summary_bn=safest_summary,
+        location_source=location_source,
     )
 
 
 async def fetch_weather(
-    latitude: float, longitude: float, district_id: str, district_name: str
+    latitude: float | None = None,
+    longitude: float | None = None,
+    district_id: str | None = None,
+    district_name: str | None = None,
+    *,
+    location_source: LocationSource | None = None,
 ) -> WeatherFacts | None:
     """Fetch 48h of future weather. Returns None on any failure - weather is optional.
 
     A missing weather block means the LLM is told not to mention weather at all,
     which is honest. An invented forecast is not.
     """
+    resolved_source: LocationSource
+    if location_source is not None:
+        resolved_source = location_source
+    elif latitude is not None and longitude is not None:
+        if district_id is None:
+            resolved_source = "gps"
+        else:
+            known = get_district(district_id)
+            if (
+                known is not None
+                and math.isclose(latitude, float(str(known["latitude"])), abs_tol=1e-4)
+                and math.isclose(longitude, float(str(known["longitude"])), abs_tol=1e-4)
+            ):
+                resolved_source = "district"
+            else:
+                resolved_source = "gps"
+    else:
+        resolved_source = "district"
+
+    if resolved_source == "gps":
+        if latitude is None or longitude is None:
+            return None
+        req_lat = latitude
+        req_lon = longitude
+        nearest = find_nearest_district(req_lat, req_lon)
+        resolved_district_id = str(nearest["id"])
+        resolved_district_name = f"{nearest['name']} (সঠিক অবস্থান)"
+        cache_prefix = f"gps:{req_lat:.2f},{req_lon:.2f}"
+    else:
+        known = get_district(district_id) if district_id else None
+        if latitude is not None and longitude is not None:
+            req_lat = latitude
+            req_lon = longitude
+            resolved_district_id = district_id or (str(known["id"]) if known else "unknown")
+            resolved_district_name = district_name or (
+                str(known["name"]) if known else resolved_district_id
+            )
+        else:
+            if known is None:
+                return None
+            req_lat = float(str(known["latitude"]))
+            req_lon = float(str(known["longitude"]))
+            resolved_district_id = str(known["id"])
+            resolved_district_name = district_name or str(known["name"])
+        cache_prefix = resolved_district_id
+
     current_hour = _current_dhaka_hour()
-    cache_key = f"{district_id}:{current_hour.isoformat()}"
+    cache_key = f"{cache_prefix}:{current_hour.isoformat()}"
     cached = _cache.get(cache_key)
     if cached and time.monotonic() - cached[0] < _cache_seconds:
         return cached[1]
 
     params: dict[str, str | int | float] = {
-        "latitude": latitude,
-        "longitude": longitude,
+        "latitude": req_lat,
+        "longitude": req_lon,
         "hourly": f"precipitation_probability,precipitation,wind_speed_10m,{HUMIDITY_FIELD}",
         "forecast_days": 3,
         "timezone": "Asia/Dhaka",
@@ -408,23 +465,32 @@ async def fetch_weather(
         async with httpx.AsyncClient(timeout=settings.weather_timeout_ms / 1000) as client:
             response = await client.get(f"{settings.open_meteo_base_url}/forecast", params=params)
             response.raise_for_status()
-            facts = classify(response.json(), district_id, district_name, now=current_hour)
+            facts = classify(
+                response.json(),
+                resolved_district_id,
+                resolved_district_name,
+                now=current_hour,
+                location_source=resolved_source,
+            )
     except (httpx.HTTPError, KeyError, TypeError, ValueError) as exc:
         # `str(ConnectTimeout())` is empty, so a bare %s logs nothing useful.
         # This is the only signal that a result lost its weather block.
         log.warning(
             "weather fetch failed for %s: %s: %s",
-            district_id,
+            resolved_district_id,
             exc.__class__.__name__,
             str(exc) or "no detail",
         )
         return None
 
     if facts is None:
-        log.warning("weather payload had no usable future hourly data for %s", district_id)
+        log.warning(
+            "weather payload had no usable future hourly data for %s",
+            resolved_district_id,
+        )
         return None
 
-    for old_key in [k for k in _cache if k.startswith(f"{district_id}:") and k != cache_key]:
+    for old_key in [k for k in _cache if k.startswith(f"{cache_prefix}:") and k != cache_key]:
         _cache.pop(old_key, None)
     _cache[cache_key] = (time.monotonic(), facts)
     return facts

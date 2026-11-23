@@ -7,6 +7,7 @@ export const API_PREFIX = '/api/v1' as const;
 export const API_ROUTES = {
   health: '/health',
   analyses: '/analyses',
+  tts: '/tts',
 } as const;
 
 export function analysisPath(id: string): string {

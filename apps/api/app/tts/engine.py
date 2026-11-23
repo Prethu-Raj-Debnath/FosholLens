@@ -96,6 +96,14 @@ def prepare_text(text: str, required_terms: list[str] | None = None) -> str:
     return prepared
 
 
+def sanitize_for_speech(text: str) -> str:
+    """Strip markdown and stray Latin runs (e.g. PPE, GPS) for on-demand UI cards."""
+    cleaned = unicodedata.normalize("NFC", text).translate(_STRIP)
+    cleaned = re.sub(r"[A-Za-z]+", " ", cleaned)
+    cleaned = re.sub(r"\(\s*\)", "", cleaned)
+    return " ".join(cleaned.split()).strip()
+
+
 def _encoder_args(target: Path) -> tuple[list[str], str]:
     if settings.tts_format == "opus":
         return (

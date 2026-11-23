@@ -5,14 +5,18 @@ Thin: parse, delegate, serialise. All pipeline logic lives in `jobs.pipeline`.
 
 from __future__ import annotations
 
+import hashlib
 import json
+import logging
+import math
 import shutil
 import uuid
+from collections import OrderedDict
 from datetime import UTC, datetime
 from typing import Annotated, Any
 
 from fastapi import APIRouter, File, Form, HTTPException, UploadFile
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, Response
 
 from . import store
 from .config import settings
@@ -22,16 +26,32 @@ from .contracts import (
     CreateAnalysisResponse,
     District,
     HealthResponse,
+    TtsRequest,
 )
 from .grounding import knowledge_base
 from .grounding.districts import DISTRICTS, get_district
 from .jobs import pipeline
-from .tts.engine import audio_mime, get_engine
+from .tts.engine import (
+    TtsSafetyError,
+    TtsUnavailable,
+    audio_mime,
+    get_engine,
+    sanitize_for_speech,
+)
 from .vision.classifier import get_classifier
 
+log = logging.getLogger(__name__)
 router = APIRouter()
 
 MAX_UPLOAD_BYTES = 8 * 1024 * 1024
+MAX_TTS_TEXT_CHARS = 600
+TTS_MEMORY_CACHE_MAX = 64
+_tts_memory_cache: OrderedDict[str, tuple[bytes, str]] = OrderedDict()
+
+
+def clear_tts_memory_cache() -> None:
+    """Clear the bounded in-memory on-demand TTS cache (used in tests)."""
+    _tts_memory_cache.clear()
 ALLOWED_AUDIO_MIMES = frozenset(
     {
         "audio/webm",
@@ -148,6 +168,8 @@ async def create_analysis(
     image: Annotated[UploadFile, File()],
     crop: Annotated[str, Form()] = "rice",
     district: Annotated[str | None, Form()] = None,
+    latitude: Annotated[float | None, Form()] = None,
+    longitude: Annotated[float | None, Form()] = None,
     question_text: Annotated[str | None, Form()] = None,
     audio: Annotated[UploadFile | None, File()] = None,
 ) -> CreateAnalysisResponse:
@@ -160,6 +182,16 @@ async def create_analysis(
     district = (district or "").strip() or None
     if district is not None and get_district(district) is None:
         raise HTTPException(status_code=400, detail="unknown_district")
+
+    if (latitude is None) != (longitude is None):
+        raise HTTPException(status_code=400, detail="invalid_coordinates")
+    if latitude is not None and longitude is not None and not (
+        math.isfinite(latitude)
+        and math.isfinite(longitude)
+        and -90.0 <= latitude <= 90.0
+        and -180.0 <= longitude <= 180.0
+    ):
+        raise HTTPException(status_code=400, detail="invalid_coordinates")
 
     # Rice and potato only: those are the crops the shipped model can name, and
     # the only ones with curated advice. Accepting tomato or chili here would
@@ -205,6 +237,8 @@ async def create_analysis(
         analysis_id,
         crop,
         district,
+        latitude=latitude,
+        longitude=longitude,
         question_text=cleaned_question,
         audio_bytes=audio_bytes,
         audio_mime=audio_mime,
@@ -292,6 +326,58 @@ async def get_audio(analysis_id: str) -> Any:
         path,
         media_type=media_type,
         headers={"Cache-Control": "public, max-age=31536000, immutable"},
+    )
+
+
+@router.post("/tts", response_model=None)
+async def synthesize_tts(payload: TtsRequest) -> Response:
+    cleaned = " ".join(payload.text.split()).strip()
+    if not cleaned:
+        raise HTTPException(status_code=400, detail="empty_text")
+    if len(cleaned) > MAX_TTS_TEXT_CHARS:
+        raise HTTPException(status_code=400, detail="text_too_long")
+
+    speakable = sanitize_for_speech(cleaned)
+    if not speakable:
+        raise HTTPException(status_code=400, detail="empty_text")
+
+    engine = get_engine()
+    if not engine.available:
+        raise HTTPException(status_code=503, detail="tts_unavailable")
+
+    cache_key = hashlib.sha256(
+        f"{speakable}|{settings.tts_voice}|{settings.tts_format}".encode()
+    ).hexdigest()
+    cached = _tts_memory_cache.get(cache_key)
+    if cached is not None:
+        _tts_memory_cache.move_to_end(cache_key)
+        audio_bytes, mime_type = cached
+        return Response(
+            content=audio_bytes,
+            media_type=mime_type,
+            headers={"Cache-Control": "private, max-age=3600"},
+        )
+
+    try:
+        clip = await engine.synthesise(speakable, settings.audio_dir)
+    except TtsSafetyError as exc:
+        raise HTTPException(status_code=400, detail="tts_safety_rejected") from exc
+    except TtsUnavailable as exc:
+        raise HTTPException(status_code=503, detail="tts_unavailable") from exc
+    except Exception as exc:
+        log.warning("on-demand TTS failed: %s: %s", exc.__class__.__name__, str(exc) or "no detail")
+        raise HTTPException(status_code=503, detail="tts_failed") from exc
+
+    audio_bytes = clip.path.read_bytes()
+    mime_type = clip.mime
+    _tts_memory_cache[cache_key] = (audio_bytes, mime_type)
+    if len(_tts_memory_cache) > TTS_MEMORY_CACHE_MAX:
+        _tts_memory_cache.popitem(last=False)
+
+    return Response(
+        content=audio_bytes,
+        media_type=mime_type,
+        headers={"Cache-Control": "private, max-age=3600"},
     )
 
 

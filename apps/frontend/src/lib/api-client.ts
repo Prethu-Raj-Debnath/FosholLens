@@ -20,6 +20,8 @@ export interface CreateAnalysisInput {
   imageBlob: Blob;
   crop: string;
   district: string | null;
+  latitude?: number | null;
+  longitude?: number | null;
   questionText?: string | null;
   audioBlob?: Blob | null;
 }
@@ -93,6 +95,8 @@ export const api = {
     imageBlob,
     crop,
     district,
+    latitude,
+    longitude,
     questionText,
     audioBlob,
   }: CreateAnalysisInput): Promise<Created> {
@@ -100,6 +104,15 @@ export const api = {
     body.append('image', imageBlob, 'crop.jpg');
     body.append('crop', crop);
     if (district) body.append('district', district);
+    if (
+      typeof latitude === 'number' &&
+      Number.isFinite(latitude) &&
+      typeof longitude === 'number' &&
+      Number.isFinite(longitude)
+    ) {
+      body.append('latitude', String(latitude));
+      body.append('longitude', String(longitude));
+    }
     const trimmedQuestion = questionText?.trim();
     if (trimmedQuestion) body.append('question_text', trimmedQuestion);
     if (audioBlob && audioBlob.size > 0) {
@@ -108,6 +121,15 @@ export const api = {
 
     const response = await request('/analyses', { method: 'POST', body });
     return (await response.json()) as Created;
+  },
+
+  async synthesizeSpeech(text: string): Promise<Blob> {
+    const response = await request('/tts', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ text }),
+    });
+    return response.blob();
   },
 
   async listAnalyses(): Promise<AnalysisSummary[]> {

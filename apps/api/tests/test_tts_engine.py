@@ -216,3 +216,95 @@ def test_get_audio_serves_wav_with_200_and_audio_wav_mime(
     finally:
         engine_module.get_engine.cache_clear()
         reset_writer()
+
+
+def test_post_tts_validation_and_unavailable_status(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from fastapi.testclient import TestClient
+
+    from app.config import settings
+    from app.main import app
+    from app.routes import clear_tts_memory_cache
+
+    storage = tmp_path / "storage"
+    monkeypatch.setattr(settings, "database_path", storage / "test.db")
+    monkeypatch.setattr(settings, "storage_dir", storage)
+    monkeypatch.setattr(settings, "vision_enabled", False)
+    for directory in (settings.images_dir, settings.audio_dir):
+        directory.mkdir(parents=True, exist_ok=True)
+
+    clear_tts_memory_cache()
+    engine_module.get_engine.cache_clear()
+
+    try:
+        with TestClient(app) as client:
+            assert client.post("/api/v1/tts", json={}).status_code == 422
+
+            for bad_text in ("", "   ", "Hello PPE"):
+                resp = client.post("/api/v1/tts", json={"text": bad_text})
+                assert resp.status_code == 400
+                assert resp.json()["detail"] == "empty_text"
+
+            too_long = client.post("/api/v1/tts", json={"text": "ক" * 601})
+            assert too_long.status_code == 400
+            assert too_long.json()["detail"] == "text_too_long"
+
+            monkeypatch.setattr(settings, "tts_enabled", False)
+            unavailable = client.post("/api/v1/tts", json={"text": "এখন স্প্রে করার অনুকূল সময়।"})
+            assert unavailable.status_code == 503
+            assert unavailable.json()["detail"] == "tts_unavailable"
+    finally:
+        clear_tts_memory_cache()
+        engine_module.get_engine.cache_clear()
+
+
+def test_post_tts_synthesises_strips_latin_and_caches_in_memory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from fastapi.testclient import TestClient
+
+    from app.config import settings
+    from app.main import app
+    from app.routes import clear_tts_memory_cache
+
+    storage = tmp_path / "storage"
+    monkeypatch.setattr(settings, "database_path", storage / "test.db")
+    monkeypatch.setattr(settings, "storage_dir", storage)
+    monkeypatch.setattr(settings, "tts_enabled", True)
+    monkeypatch.setattr(settings, "tts_format", "mp3")
+    monkeypatch.setattr(settings, "vision_enabled", False)
+    for directory in (settings.images_dir, settings.audio_dir):
+        directory.mkdir(parents=True, exist_ok=True)
+
+    clear_tts_memory_cache()
+    engine_module.get_engine.cache_clear()
+    eng = engine_module.get_engine()
+
+    seen_texts: list[str] = []
+
+    async def fake_synthesise(text: str, out_dir: Path, required_terms=None) -> AudioClip:
+        seen_texts.append(text)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        clip_path = out_dir / "card.mp3"
+        clip_path.write_bytes(b"ID3fake-mp3-bytes")
+        return AudioClip(clip_path, 900, 17, "audio/mpeg")
+
+    monkeypatch.setattr(eng, "synthesise", fake_synthesise)
+
+    try:
+        with TestClient(app) as client:
+            payload = {"text": "**পরামর্শ** (PPE): এখন স্প্রে করুন।"}
+            first = client.post("/api/v1/tts", json=payload)
+            assert first.status_code == 200
+            assert first.headers["content-type"].startswith("audio/mpeg")
+            assert first.content == b"ID3fake-mp3-bytes"
+            assert seen_texts == ["পরামর্শ : এখন স্প্রে করুন।"]
+
+            second = client.post("/api/v1/tts", json=payload)
+            assert second.status_code == 200
+            assert second.content == b"ID3fake-mp3-bytes"
+            assert len(seen_texts) == 1
+    finally:
+        clear_tts_memory_cache()
+        engine_module.get_engine.cache_clear()

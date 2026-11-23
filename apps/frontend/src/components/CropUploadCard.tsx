@@ -95,6 +95,7 @@ export function CropUploadCard() {
   const [micNote, setMicNote] = useState<string | null>(null);
   const [locating, setLocating] = useState(false);
   const [gpsNote, setGpsNote] = useState<string | null>(null);
+  const [gpsCoords, setGpsCoords] = useState<{ latitude: number; longitude: number } | null>(null);
 
   // Object URL for the on-screen preview, revoked on replace/unmount.
   const previewRef = useRef<string | null>(null);
@@ -289,11 +290,9 @@ export function CropUploadCard() {
     navigator.geolocation.getCurrentPosition(
       (position) => {
         setLocating(false);
-        const nearest = findNearestDistrict(
-          position.coords.latitude,
-          position.coords.longitude,
-          districts,
-        );
+        const { latitude, longitude } = position.coords;
+        setGpsCoords({ latitude, longitude });
+        const nearest = findNearestDistrict(latitude, longitude, districts);
         if (nearest) {
           choose(nearest.id);
           setGpsNote(`অবস্থান অনুযায়ী নির্বাচিত: ${nearest.name}`);
@@ -303,6 +302,7 @@ export function CropUploadCard() {
       },
       () => {
         setLocating(false);
+        setGpsCoords(null);
         setGpsNote('অবস্থান জানার অনুমতি পাওয়া যায়নি; তালিকা থেকে জেলা বেছে নিন।');
       },
       { enableHighAccuracy: false, timeout: 8000, maximumAge: 300_000 },
@@ -330,6 +330,8 @@ export function CropUploadCard() {
         imageBlob: prepared.blob,
         crop,
         district: district || null,
+        latitude: gpsCoords?.latitude ?? null,
+        longitude: gpsCoords?.longitude ?? null,
         questionText,
         audioBlob,
       });
@@ -408,6 +410,7 @@ export function CropUploadCard() {
             value={district}
             disabled={busy}
             onChange={(event) => {
+              setGpsCoords(null);
               setGpsNote(null);
               choose(event.target.value);
             }}
@@ -423,6 +426,11 @@ export function CropUploadCard() {
       </div>
 
       {gpsNote && <p className="gps-note">{gpsNote}</p>}
+      {gpsCoords && (
+        <p className="gps-badge" role="status">
+          সঠিক GPS অবস্থান ব্যবহৃত হচ্ছে
+        </p>
+      )}
 
       <div className="question-box">
         <div className="question-box__header">

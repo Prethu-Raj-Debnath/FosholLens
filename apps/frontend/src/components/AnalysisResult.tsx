@@ -2,13 +2,24 @@ import type { AnalysisResult } from '@foshol-lens/contracts';
 import { BookOpen, ChevronLeft, MessageSquare, ShieldAlert, UserCheck } from 'lucide-react';
 import { Link } from 'react-router-dom';
 import { mediaUrl } from '../lib/api-client';
-import { formatBengaliDate } from '../lib/format';
+import { buildSpeechText, formatBengaliDate } from '../lib/format';
 import { AudioPlayer } from './AudioPlayer';
+import { SpeakCardButton } from './SpeakCardButton';
 import { WeatherCard } from './WeatherCard';
+
+function buildTreatmentSpeech(result: AnalysisResult): string {
+  if (!result.treatment) return '';
+  return buildSpeechText([
+    result.treatment.summary,
+    ...result.treatment.steps,
+    result.ppeReminder ? `নিরাপত্তা নির্দেশনা: ${result.ppeReminder}` : null,
+  ]);
+}
 
 export function AnalysisResultView({ result }: { result: AnalysisResult }) {
   const { diagnosis, uncertainty, narrative } = result;
   const imageSrc = mediaUrl(result.imageUrl);
+  const treatmentSpeech = buildTreatmentSpeech(result);
 
   return (
     <div className="page">
@@ -91,9 +102,18 @@ export function AnalysisResultView({ result }: { result: AnalysisResult }) {
 
           {result.treatment && (
             <section className="card card--plain">
-              <h2 className="card__label">
-                {uncertainty.isUncertain ? 'সাধারণ পরামর্শ' : 'প্রস্তাবিত চিকিৎসা'}
-              </h2>
+              <div className="card__header-row">
+                <h2 className="card__label">
+                  {uncertainty.isUncertain ? 'সাধারণ পরামর্শ' : 'প্রস্তাবিত চিকিৎসা'}
+                </h2>
+                {treatmentSpeech && (
+                  <SpeakCardButton
+                    text={treatmentSpeech}
+                    label="শুনুন"
+                    ariaLabel="প্রস্তাবিত চিকিৎসা শুনুন"
+                  />
+                )}
+              </div>
               <p className="card__text">{result.treatment.summary}</p>
               <ul className="list">
                 {result.treatment.steps.map((step) => (

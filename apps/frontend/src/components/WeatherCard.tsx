@@ -1,7 +1,8 @@
 import type { HourlySprayWindow, SpraySafety, Weather } from '@foshol-lens/contracts';
 import { Clock, CloudRain, Wind } from 'lucide-react';
 import { useEffect, useState } from 'react';
-import { toBengaliDigits } from '../lib/format';
+import { buildSpeechText, toBengaliDigits } from '../lib/format';
+import { SpeakCardButton } from './SpeakCardButton';
 
 const SAFETY_LABELS: Record<SpraySafety, string> = {
   green: 'নিরাপদ',
@@ -71,6 +72,22 @@ function defaultSelectedIndex(windows: HourlySprayWindow[]): number {
   return safeDayIdx >= 0 ? safeDayIdx : 0;
 }
 
+function buildWeatherSpeech(weather: Weather): string {
+  const locationLine =
+    weather.locationSource === 'gps'
+      ? `${weather.district} এলাকার আবহাওয়া।`
+      : `${weather.district} জেলার আবহাওয়া।`;
+  const verdictLine = weather.sprayWindowOk
+    ? 'এখন স্প্রে করার অনুকূল সময়।'
+    : 'এখনই স্প্রে করবেন না।';
+  return buildSpeechText([
+    locationLine,
+    verdictLine,
+    weather.reason,
+    weather.safestWindowSummaryBn,
+  ]);
+}
+
 /**
  * Weather facts plus the deterministic 12h verdict and 48h spray timeline.
  *
@@ -92,14 +109,29 @@ export function WeatherCard({ weather }: { weather: Weather }) {
   const selectedDayLabel =
     dayGroups.find((group) => group.slots.some((slot) => slot.index === selectedIndex))?.label ??
     'আজ';
+  const weatherSpeech = buildWeatherSpeech(weather);
 
   return (
     <section className={`card ${blocking ? 'card--warn' : 'card--plain'}`}>
-      <p className="card__eyebrow">{weather.district} জেলার আবহাওয়া</p>
+      <div className="card__header-row">
+        <div>
+          <p className="card__eyebrow">
+            {weather.locationSource === 'gps'
+              ? `${weather.district} — আবহাওয়া`
+              : `${weather.district} জেলার আবহাওয়া`}
+          </p>
 
-      <h2 className="card__label">
-        {weather.sprayWindowOk ? 'এখন স্প্রে করার অনুকূল সময়' : 'এখনই স্প্রে করবেন না'}
-      </h2>
+          <h2 className="card__label">
+            {weather.sprayWindowOk ? 'এখন স্প্রে করার অনুকূল সময়' : 'এখনই স্প্রে করবেন না'}
+          </h2>
+        </div>
+
+        <SpeakCardButton
+          text={weatherSpeech}
+          label="শুনুন"
+          ariaLabel="আবহাওয়া ও স্প্রে নির্দেশনা শুনুন"
+        />
+      </div>
 
       <p className="card__text">{weather.reason}।</p>
 

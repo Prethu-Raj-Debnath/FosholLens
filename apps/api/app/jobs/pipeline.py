@@ -21,7 +21,7 @@ from typing import Any
 from .. import store
 from ..config import settings
 from ..grounding import knowledge_base, rag
-from ..grounding.districts import get_district
+from ..grounding.districts import find_nearest_district, get_district
 from ..grounding.weather import fetch_weather
 from ..llm.audio_input import transcribe_bangla_question
 from ..llm.writer import InvalidNarrative, get_writer
@@ -69,6 +69,8 @@ def spawn(
     crop_id: str,
     district_id: str | None,
     *,
+    latitude: float | None = None,
+    longitude: float | None = None,
     question_text: str | None = None,
     audio_bytes: bytes | None = None,
     audio_mime: str | None = None,
@@ -79,6 +81,8 @@ def spawn(
             analysis_id,
             crop_id,
             district_id,
+            latitude=latitude,
+            longitude=longitude,
             question_text=question_text,
             audio_bytes=audio_bytes,
             audio_mime=audio_mime,
@@ -93,6 +97,8 @@ async def run(
     crop_id: str,
     district_id: str | None,
     *,
+    latitude: float | None = None,
+    longitude: float | None = None,
     question_text: str | None = None,
     audio_bytes: bytes | None = None,
     audio_mime: str | None = None,
@@ -104,6 +110,8 @@ async def run(
                 analysis_id,
                 crop_id,
                 district_id,
+                latitude=latitude,
+                longitude=longitude,
                 question_text=question_text,
                 audio_bytes=audio_bytes,
                 audio_mime=audio_mime,
@@ -139,6 +147,8 @@ async def _pipeline(
     crop_id: str,
     district_id: str | None,
     *,
+    latitude: float | None = None,
+    longitude: float | None = None,
     question_text: str | None = None,
     audio_bytes: bytes | None = None,
     audio_mime: str | None = None,
@@ -165,13 +175,24 @@ async def _pipeline(
 
     district = get_district(district_id) if district_id else None
     weather = None
-    if district is not None:
+    display_district: str | None = None
+    if latitude is not None and longitude is not None:
+        nearest = find_nearest_district(latitude, longitude)
         weather = await fetch_weather(
-            latitude=float(district["latitude"]),  # type: ignore[arg-type]
-            longitude=float(district["longitude"]),  # type: ignore[arg-type]
+            latitude=latitude,
+            longitude=longitude,
+            district_id=str(nearest["id"]),
+            district_name=str(nearest["name"]),
+            location_source="gps",
+        )
+        display_district = str(district["name"]) if district else str(nearest["name"])
+    elif district is not None:
+        weather = await fetch_weather(
             district_id=str(district["id"]),
             district_name=str(district["name"]),
+            location_source="district",
         )
+        display_district = str(district["name"])
 
     rag_disease_id = (
         disease["id"] if confirmed or disease["id"] == "rice_other" else "uncertain"
@@ -214,7 +235,7 @@ async def _pipeline(
         confirmed=confirmed,
         grounding=grounding,
         farmer_question=farmer_question,
-        district_name=str(district["name"]) if district else None,
+        district_name=display_district,
     )
     await store.save_result(analysis_id, result, disease_id=disease["id"])
 
@@ -609,6 +630,7 @@ def _build_result(
                 "reason": weather.reason,
                 "hourlyWindows": [w.as_contract_dict() for w in weather.hourly_windows],
                 "safestWindowSummaryBn": weather.safest_window_summary_bn,
+                "locationSource": weather.location_source,
             }
             if weather
             else None

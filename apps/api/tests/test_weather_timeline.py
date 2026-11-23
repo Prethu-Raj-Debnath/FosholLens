@@ -485,3 +485,143 @@ def test_synthetic_payload_without_time_never_uses_2026_01_01() -> None:
     assert len(facts.hourly_windows) == 12
     assert not any(w.time_iso.startswith("2026-01-01") for w in facts.hourly_windows)
     assert facts.hourly_windows[0].time_iso.startswith("2026-11-23T14:00")
+
+
+def test_exact_gps_coordinates_query_open_meteo_and_share_rounded_cache(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from app.grounding import weather as weather_module
+
+    weather_module._cache.clear()
+    seen_params: list[dict] = []
+    start = datetime.now(_DHAKA_TZ).replace(minute=0, second=0, microsecond=0)
+    payload = _make_48h_payload(start=start, hours=72)
+
+    class FakeResponse:
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict:
+            return payload
+
+    class FakeClient:
+        def __init__(self, **_kwargs) -> None:
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args) -> None:
+            return None
+
+        async def get(self, _url: str, params: dict) -> FakeResponse:
+            seen_params.append(params)
+            return FakeResponse()
+
+    storage = tmp_path / "storage"
+    monkeypatch.setattr(settings, "database_path", storage / "test.db")
+    monkeypatch.setattr(settings, "storage_dir", storage)
+    monkeypatch.setattr(settings, "tts_enabled", False)
+    monkeypatch.setattr(settings, "vision_enabled", False)
+    monkeypatch.setattr(settings, "gemini_api_key", "")
+    monkeypatch.setattr(settings, "llm_api_key", "")
+    monkeypatch.setattr(weather_module.httpx, "AsyncClient", FakeClient)
+    reset_writer()
+    for directory in (settings.images_dir, settings.audio_dir):
+        directory.mkdir(parents=True, exist_ok=True)
+
+    with TestClient(app) as client:
+        # 1. Exact GPS coordinates near Comilla (centroid is 23.4607, 91.1809).
+        first = client.post(
+            "/api/v1/analyses",
+            files={"image": ("crop.jpg", _jpeg(), "image/jpeg")},
+            data={
+                "crop": "rice",
+                "district": "comilla",
+                "latitude": "23.4712",
+                "longitude": "91.1754",
+            },
+        )
+        assert first.status_code == 202
+        first_id = first.json()["id"]
+        _wait(client, first_id)
+
+        first_result = AnalysisResult.model_validate(
+            client.get(f"/api/v1/analyses/{first_id}/result").json()
+        )
+        assert first_result.weather is not None
+        assert first_result.weather.locationSource == "gps"
+        assert first_result.weather.district == "কুমিল্লা (সঠিক অবস্থান)"
+        assert len(seen_params) == 1
+        assert seen_params[0]["latitude"] == pytest.approx(23.4712)
+        assert seen_params[0]["longitude"] == pytest.approx(91.1754)
+
+        # 2. Nearby GPS point (~500m away) shares the rounded gps:23.47,91.18 cache.
+        second = client.post(
+            "/api/v1/analyses",
+            files={"image": ("crop.jpg", _jpeg(), "image/jpeg")},
+            data={"crop": "rice", "latitude": "23.474", "longitude": "91.176"},
+        )
+        assert second.status_code == 202
+        second_id = second.json()["id"]
+        _wait(client, second_id)
+
+        second_result = AnalysisResult.model_validate(
+            client.get(f"/api/v1/analyses/{second_id}/result").json()
+        )
+        assert second_result.weather is not None
+        assert second_result.weather.locationSource == "gps"
+        assert second_result.weather.district == "কুমিল্লা (সঠিক অবস্থান)"
+        assert len(seen_params) == 1
+
+        # 3. Manual district without GPS falls back to district centroid.
+        manual = client.post(
+            "/api/v1/analyses",
+            files={"image": ("crop.jpg", _jpeg(), "image/jpeg")},
+            data={"crop": "rice", "district": "comilla"},
+        )
+        assert manual.status_code == 202
+        manual_id = manual.json()["id"]
+        _wait(client, manual_id)
+
+        manual_result = AnalysisResult.model_validate(
+            client.get(f"/api/v1/analyses/{manual_id}/result").json()
+        )
+        assert manual_result.weather is not None
+        assert manual_result.weather.locationSource == "district"
+        assert manual_result.weather.district == "কুমিল্লা"
+        assert len(seen_params) == 2
+        assert seen_params[1]["latitude"] == pytest.approx(23.4607)
+        assert seen_params[1]["longitude"] == pytest.approx(91.1809)
+
+
+@pytest.mark.parametrize(
+    "coords",
+    [
+        {"latitude": "23.5"},
+        {"longitude": "90.4"},
+        {"latitude": "91.0", "longitude": "90.4"},
+        {"latitude": "-90.5", "longitude": "90.4"},
+        {"latitude": "23.5", "longitude": "181.0"},
+        {"latitude": "23.5", "longitude": "-180.5"},
+    ],
+)
+def test_invalid_gps_coordinates_return_400(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, coords: dict[str, str]
+) -> None:
+    storage = tmp_path / "storage"
+    monkeypatch.setattr(settings, "database_path", storage / "test.db")
+    monkeypatch.setattr(settings, "storage_dir", storage)
+    monkeypatch.setattr(settings, "tts_enabled", False)
+    monkeypatch.setattr(settings, "vision_enabled", False)
+    for directory in (settings.images_dir, settings.audio_dir):
+        directory.mkdir(parents=True, exist_ok=True)
+
+    with TestClient(app) as client:
+        resp = client.post(
+            "/api/v1/analyses",
+            files={"image": ("crop.jpg", _jpeg(), "image/jpeg")},
+            data={"crop": "rice", **coords},
+        )
+        assert resp.status_code == 400
+        assert resp.json()["detail"] == "invalid_coordinates"

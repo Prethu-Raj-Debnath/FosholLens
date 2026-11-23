@@ -6,6 +6,8 @@ indoors, and coarse enough that the location never becomes identifying.
 
 from __future__ import annotations
 
+import math
+
 DISTRICTS: list[dict[str, object]] = [
     # Dhaka division
     {"id": "dhaka", "name": "ঢাকা", "division": "ঢাকা", "latitude": 23.8103, "longitude": 90.4125},
@@ -398,6 +400,32 @@ _BY_ID = {str(d["id"]): d for d in DISTRICTS}
 
 def get_district(district_id: str) -> dict[str, object] | None:
     return _BY_ID.get(district_id)
+
+
+def _haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    r_km = 6371.0
+    d_lat = math.radians(lat2 - lat1)
+    d_lon = math.radians(lon2 - lon1)
+    a = (
+        math.sin(d_lat / 2) ** 2
+        + math.cos(math.radians(lat1))
+        * math.cos(math.radians(lat2))
+        * math.sin(d_lon / 2) ** 2
+    )
+    return 2 * r_km * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+
+
+def find_nearest_district(latitude: float, longitude: float) -> dict[str, object]:
+    """Return the Bangladesh district closest to the provided coordinates."""
+    return min(
+        DISTRICTS,
+        key=lambda item: _haversine_km(
+            latitude,
+            longitude,
+            float(str(item["latitude"])),
+            float(str(item["longitude"])),
+        ),
+    )
 
 
 def default_district() -> dict[str, object]:

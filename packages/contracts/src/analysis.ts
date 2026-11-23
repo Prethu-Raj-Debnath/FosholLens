@@ -85,6 +85,10 @@ export const SPRAY_SAFETIES = ['green', 'amber', 'red'] as const;
 export const SpraySafetySchema = z.enum(SPRAY_SAFETIES);
 export type SpraySafety = z.infer<typeof SpraySafetySchema>;
 
+export const LOCATION_SOURCES = ['gps', 'district'] as const;
+export const LocationSourceSchema = z.enum(LOCATION_SOURCES);
+export type LocationSource = z.infer<typeof LocationSourceSchema>;
+
 export const HourlySprayWindowSchema = z.object({
   timeIso: z.string(),
   rainProb: z.number().int(),
@@ -104,6 +108,7 @@ export const WeatherSchema = z.object({
   reason: z.string(),
   hourlyWindows: z.array(HourlySprayWindowSchema).default([]),
   safestWindowSummaryBn: z.string().nullable().optional(),
+  locationSource: LocationSourceSchema.default('district'),
   source: z.string().optional(),
 });
 export type Weather = z.infer<typeof WeatherSchema>;

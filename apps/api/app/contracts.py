@@ -27,6 +27,7 @@ AudioStatus = Literal["none", "pending", "ready", "failed"]
 GeneratedBy = Literal["llm", "template"]
 CropId = Literal["rice", "potato"]
 SpraySafety = Literal["green", "amber", "red"]
+LocationSource = Literal["gps", "district"]
 
 
 class Diagnosis(BaseModel):
@@ -83,6 +84,7 @@ class Weather(BaseModel):
     reason: str
     hourlyWindows: list[HourlySprayWindow] = Field(default_factory=list)
     safestWindowSummaryBn: str | None = None
+    locationSource: LocationSource = "district"
     source: str = "Open-Meteo"
 
 
@@ -158,6 +160,10 @@ class District(BaseModel):
     division: str
     latitude: float
     longitude: float
+
+
+class TtsRequest(BaseModel):
+    text: str
 
 
 class ApiErrorBody(BaseModel):
