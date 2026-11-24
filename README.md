@@ -72,9 +72,100 @@ The backend runs a 4-stage asynchronous job pipeline (`reading -> grounding -> w
 - **Text-to-Speech:** [`sulabhkatiyar/indic-tiny-tts-bengali`](https://huggingface.co/sulabhkatiyar/indic-tiny-tts-bengali) (local ONNX, CPU) + `ffmpeg` -> MP3 (default) / Opus / WAV fallback
 - **Weather API:** [Open-Meteo Forecast API](https://open-meteo.com/) (key-free, non-commercial use)
 - **Datasets & Agricultural Knowledge Sources:**
-  - PlantVillage Dataset (Potato leaf diseases) & Paddy Doctor Dataset (Rice leaf diseases)
+  - **Saon110 Bangladesh multi-crop plant disease dataset** (Hugging Face, CC BY-NC-SA 4.0) — the 5 rice classes
+  - **PlantVillage** (Hughes & Salathé, 2015; Mohanty et al., 2016) — potato early blight, late blight, healthy (lab photos)
+  - **Irish Potato Imagery Dataset** (Laizer & Mduma, 2025; Zenodo record 8286529, CC BY 4.0 per the paper) — field potato photos
+  - **Paddy Doctor** (Petchiammal et al., 2022) — public rice dataset referenced by the merged Saon110 collection
   - **BARI** (*Bangladesh Agricultural Research Institute* — *BARI কৃষি প্রযুক্তি হাতবই*)
   - **BRRI** (*Bangladesh Rice Research Institute* — *BRRI আধুনিক ধানের চাষ*, *BRRI Knowledge Bank*) & **DAE** crop protection safety guidance
+
+---
+
+## Leaf Model: Training, Data & Evaluation
+
+The shipped vision model is **EfficientNet-B0**, fine-tuned for 8 rice and potato leaf classes and exported to ONNX (`apps/api/models/foshollens_leaf.onnx`, 16 MB). It runs on CPU via `onnxruntime` at roughly 40 ms per photo. Training was done during the pre-build window on a free Kaggle GPU.
+
+### Classes
+
+| Crop | Class ID | Condition |
+| --- | --- | --- |
+| Rice | `rice_blast` | Blast (fungal) |
+| Rice | `rice_brown_spot` | Brown spot (fungal) |
+| Rice | `rice_bacterial_leaf_blight` | Bacterial leaf blight |
+| Rice | `rice_tungro` | Tungro (viral, leafhopper-spread) |
+| Rice | `rice_healthy` | Healthy |
+| Potato | `potato_early_blight` | Early blight (fungal) |
+| Potato | `potato_late_blight` | Late blight (water mould) |
+| Potato | `potato_healthy` | Healthy |
+
+### Data sources and licences
+
+| Source | Used for | Licence | Photo type |
+| --- | --- | --- | --- |
+| Saon110 Bangladesh multi-crop plant disease dataset (Hugging Face) | The 5 rice classes | CC BY-NC-SA 4.0 | Merged public sources, mixed capture conditions |
+| PlantVillage (Hughes & Salathé, 2015; Mohanty et al., 2016) | Potato early blight, late blight, healthy | CC BY-SA 3.0 as listed by the loader; not independently verified | Lab: single leaf on a plain background |
+| Irish Potato Imagery Dataset (Laizer & Mduma, 2025; Zenodo record 8286529) | The same 3 potato classes | CC BY 4.0 per the paper; check the Zenodo record before any reuse | Field: phone photos taken on farms |
+
+Two potato sources are used deliberately: a model trained only on lab photos mislabelled a field photo of a whole potato plant, and real field photos removed that failure. Paddy Doctor (Petchiammal et al., 2022) is credited as a public rice dataset referenced by the merged Saon110 collection.
+
+**Licence note:** the Saon110 rice data is **non-commercial and share-alike**. This hackathon prototype complies; a commercial deployment would need different data or explicit permission.
+
+### Splits
+
+Every photo belongs to exactly one of three groups. The model learns from the training group, validation picks the best epoch, and the test group is scored once at the end.
+
+| Class | Train | Validation | Test |
+| --- | --- | --- | --- |
+| Potato early blight | 2,000 | 250 | 250 |
+| Potato healthy | 1,322 | 165 | 165 |
+| Potato late blight | 2,000 | 250 | 250 |
+| Rice bacterial leaf blight | 1,443 | 400 | 208 |
+| Rice blast | 2,223 | 400 | 320 |
+| Rice brown spot | 1,794 | 400 | 258 |
+| Rice healthy | 1,234 | 352 | 178 |
+| Rice tungro | 1,676 | 400 | 241 |
+| **Total** | **13,692** | **2,617** | **1,870** |
+
+PlantVillage has no leaf IDs, so its photos were split randomly. Near-identical photos can therefore land in both training and test groups, which we state as a leakage caveat rather than hide.
+
+### Training recipe
+
+- **Transfer learning:** start from ImageNet-pretrained EfficientNet-B0, replace the 1,000-way head with an 8-way head, and fine-tune the full network.
+- **Input:** photos stored at up to 384 px on the long side, resized to **320 × 320** for the model.
+- **Optimisation:** batch size 64, AdamW, learning rate `3e-4` with a one-cycle schedule, **25 epochs**.
+- **Augmentation:** random resized crop (30–100% of the image), horizontal flip, rotation up to 25°, colour jitter, occasional blur, random erasing.
+- **Regularisation:** dropout, stochastic depth, label smoothing, weight decay, and class weighting for the smallest class (`potato_healthy`).
+- **Model selection:** validation accuracy is checked after every epoch and the best checkpoint is kept.
+- **Export:** converted to ONNX and parity-checked against the PyTorch model (maximum difference below `2e-5`).
+- **Hardware and time:** about 1 hour for 25 epochs on a free Kaggle GPU with mixed precision.
+
+Architecture choice: EfficientNet-B0 (~5M parameters), EfficientNet-B3 (~12M) and ConvNeXt-Tiny (~28M) scored within noise of each other (98.4–98.6% on the 10-class runs), so the smallest and fastest model was shipped.
+
+### Results (held-out test split)
+
+**1,854 of 1,870 photos correct — 99.1% accuracy; macro F1 0.992.**
+
+| Class | Precision | Recall | Test photos |
+| --- | --- | --- | --- |
+| Potato early blight | 1.000 | 0.992 | 250 |
+| Potato healthy | 1.000 | 1.000 | 165 |
+| Potato late blight | 0.992 | 1.000 | 250 |
+| Rice bacterial leaf blight | 0.990 | 0.990 | 208 |
+| Rice blast | 0.994 | 0.978 | 320 |
+| Rice brown spot | 0.985 | 0.988 | 258 |
+| Rice healthy | 0.994 | 0.989 | 178 |
+| Rice tungro | 0.980 | 1.000 | 241 |
+
+Rice blast is the weakest class (recall 0.978). Most of the 16 errors are blast, brown spot and tungro being confused with each other, which is expected because those lesions look alike.
+
+### Known limitations (stated before judging)
+
+- **Same-source test set.** Test photos come from the same public collections as training photos, so accuracy on new farm phone photos will be lower than 99.1%.
+- **Lab versus field.** Part of the potato data is clean lab imagery. Field photos were added for potato, but not for every rice class.
+- **Only 8 classes.** An unseen disease or another crop is forced into one of the 8. The crop selector, the `0.6` confidence threshold and the crop-mass warning reduce this risk but do not remove it.
+- **Whole-photo classification.** The model labels the photo; it does not detect or outline lesions. A whole-plant photo can fool it, which is why the app asks for a close leaf photo.
+- **Untuned app thresholds.** `VISION_CONFIDENCE_THRESHOLD=0.6`, `VISION_MARGIN=0.30`, `VISION_MARGIN_FLOOR=0.45` and `VISION_MARGIN_MIN_CROP_MASS=0.70` are sensible defaults, not values tuned on real farmer photos.
+- **Decision support only.** The output is not a replacement for an SAAO or agriculture officer.
 
 ---
 
@@ -82,19 +173,41 @@ The backend runs a 4-stage asynchronous job pipeline (`reading -> grounding -> w
 
 In accordance with **CoU AI Hackathon 2026 Rule 10**, Team Tesseract discloses the AI tools used in building FosholLens:
 - **Antigravity:** Codebase exploration, feature implementation, refactoring, RAG/voice/timeline wiring, test execution, and build verification.
-- **Claude (Anthropic):** System architecture design, safety guard review (Latin-script TTS checks, cultural-only chemical blocking, wash-off lookahead rules), and documentation structure.
+- **Claude (Anthropic):** System architecture design, safety guard review (Latin-script TTS checks, cultural-only chemical blocking, wash-off lookahead rules), documentation structure, and review of the leaf-model training plan (transfer learning, augmentation, data splits, ONNX export).
 - **Google Gemini:** Prompt engineering for Bangla agricultural advisory & voice transcription, precomputing `gemini-embedding-001` corpus vectors, and runtime `gemini-3.5-flash-lite` inference (with Flash fallback chain).
+
+No AI output is hard-coded, pre-recorded or faked (Rule 9.3). The leaf classifier is a trained EfficientNet-B0 ONNX network, the advisory text is generated at runtime from retrieved BARI/BRRI passages, and the deterministic weather verdict is computed in code rather than by a model.
 
 ---
 
 ## Third-Party Code & Assets Credits
 
+### Software and libraries
+
 - [`sulabhkatiyar/indic-tiny-tts-bengali`](https://huggingface.co/sulabhkatiyar/indic-tiny-tts-bengali) — Local ONNX Bangla neural text-to-speech synthesis
 - [FastAPI](https://fastapi.tiangolo.com/), [Pydantic](https://docs.pydantic.dev/), [NumPy](https://numpy.org/), and [ONNX Runtime](https://onnxruntime.ai/) — Backend framework, schema validation, vector math, and CPU inference
 - [React](https://react.dev/), [Vite](https://vite.dev/), [React Router](https://reactrouter.com/), [Zod](https://zod.dev/), and [Lucide](https://lucide.dev/) — Frontend UI, routing, and contract validation
 - [Noto Sans Bengali](https://fonts.google.com/noto/specimen/Noto+Sans+Bengali) — SIL Open Font License (OFL)
-- [Open-Meteo API](https://open-meteo.com/) — Hourly weather forecast API
-- Agricultural treatment guidance credited to **BARI**, **BRRI**, and **DAE**, and leaf imagery datasets credited to **PlantVillage** and **Paddy Doctor**.
+- [FFmpeg](https://ffmpeg.org/) — TTS audio transcoding to MP3/Opus (LGPL/GPL depending on build)
+- [Open-Meteo API](https://open-meteo.com/) — Key-free hourly weather forecast API (non-commercial free tier)
+
+### Model training stack
+
+- [EfficientNet](https://arxiv.org/abs/1905.11946) (Tan & Le, 2019) — Base architecture for the leaf classifier
+- [PyTorch](https://pytorch.org/) and [timm](https://github.com/huggingface/pytorch-image-models) — Fine-tuning and model definition
+- [ONNX Runtime](https://onnxruntime.ai/) — CPU inference in production
+- [Kaggle](https://www.kaggle.com/) — Free GPU used for the 25-epoch training run
+
+### Datasets
+
+- **Saon110 Bangladesh multi-crop plant disease dataset** (Hugging Face) — **CC BY-NC-SA 4.0**. Rice classes are merged from several public sources, including the Paddy Disease Classification data. Non-commercial and share-alike.
+- **PlantVillage** — Hughes & Salathé, 2015 ([arXiv 1511.08060](https://arxiv.org/abs/1511.08060)); Mohanty et al., 2016, *Frontiers in Plant Science* 7:1419, [doi 10.3389/fpls.2016.01419](https://doi.org/10.3389/fpls.2016.01419). The loader lists CC BY-SA 3.0; we did not verify it independently. A Hugging Face mirror (`GVJahnavi/PlantVillage_dataset`) was used because the original loader failed.
+- **Irish Potato Imagery Dataset** — Laizer & Mduma, 2025; [Zenodo record 8286529](https://zenodo.org/records/8286529); [paper](https://pmc.ncbi.nlm.nih.gov/articles/PMC12020891/). The paper states CC BY 4.0; check the Zenodo record before reuse.
+- **Paddy Doctor** — Petchiammal et al., 2022 ([arXiv 2205.11108](https://arxiv.org/pdf/2205.11108)). Public rice dataset referenced by the merged Saon110 collection.
+
+### Agricultural knowledge
+
+- Treatment guidance credited to **BARI**, **BRRI**, and **DAE**. The advisory is grounded in retrieved passages from the curated corpus, not invented by the model.
 
 ---
 
@@ -248,5 +361,33 @@ npm run typecheck
 
 ## Links
 
-- **Live Deployment Link:** _[To be added after deployment]_
-- **Demo Video Link:** _[To be added before submission]_
+| Item | Value |
+| --- | --- |
+| GitHub repository | This repository (public) |
+| Live deployment link | _[To be added after deployment]_ |
+| Demo video (max 3 minutes) | _[To be added before submission]_ |
+| Test login credentials | Not applicable — the app has no login or user accounts |
+
+---
+
+## Rulebook Compliance Checklist (CoU AI Hackathon 2026)
+
+Required README content, mapped to where it lives in this document:
+
+| Requirement | Rule | Where |
+| --- | --- | --- |
+| Project, team and member names | 10.2 | [Team Tesseract](#team-tesseract) |
+| Problem and solution summary | 10.2 | [Problem & Solution Summary](#problem--solution-summary) |
+| Features and how the AI works | 10.2 | [Features & How the AI Works](#features--how-the-ai-works) |
+| Tech stack, models, APIs, datasets | 9.2, 10.2 | [Tech Stack, Models, APIs & Datasets](#tech-stack-models-apis--datasets), [Leaf Model](#leaf-model-training-data--evaluation) |
+| AI tools used, and for what | 9.1, 10.2 | [AI Tools Disclosure](#ai-tools-disclosure) |
+| Third-party code and assets, credited | 8.4, 10.2, 14 | [Third-Party Code & Assets Credits](#third-party-code--assets-credits) |
+| Open-source libraries and public APIs listed | 8.4 | [Tech Stack](#tech-stack-models-apis--datasets), [Credits](#third-party-code--assets-credits) |
+| Public or licensed data credited | 9.5 | [Data sources and licences](#data-sources-and-licences), [Datasets](#datasets) |
+| Real AI, no faked or pre-recorded output | 9.3 | [AI Tools Disclosure](#ai-tools-disclosure) |
+| Setup steps | 10.2 | [Local Setup](#local-setup) |
+| Live link and demo video | 10.2, 11, 12 | [Links](#links) |
+| Test login credentials (if the app has a login) | 12.3 | [Links](#links) — not applicable |
+| `.env.example`, no committed keys | 10.2 | [`.env.example`](.env.example), [Local Setup](#local-setup) |
+
+**Outstanding before the 24 Nov deadline:** replace the live deployment link and demo video placeholders in [Links](#links) with public URLs. A broken or private link counts as missing (Rule 12).
