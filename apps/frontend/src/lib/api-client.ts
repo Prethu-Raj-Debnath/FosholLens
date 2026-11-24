@@ -3,6 +3,7 @@ import type {
   AnalysisStage,
   AnalysisStatus,
   AnalysisSummary,
+  Weather,
 } from '@foshol-lens/contracts';
 
 const RAW_BASE_URL = (import.meta.env.VITE_API_BASE_URL ?? '').trim();
@@ -140,6 +141,17 @@ export const api = {
   async listDistricts(): Promise<District[]> {
     const response = await request('/districts');
     return (await response.json()) as District[];
+  },
+
+  async getWeather(lat: number, lon: number, label?: string | null): Promise<Weather> {
+    const params = new URLSearchParams({
+      lat: String(lat),
+      lon: String(lon),
+    });
+    const trimmedLabel = label?.trim();
+    if (trimmedLabel) params.set('label', trimmedLabel);
+    const response = await request(`/weather?${params.toString()}`);
+    return (await response.json()) as Weather;
   },
 
   async getSummary(id: string): Promise<AnalysisSummary> {

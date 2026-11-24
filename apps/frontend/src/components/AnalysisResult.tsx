@@ -1,5 +1,12 @@
 import type { AnalysisResult } from '@foshol-lens/contracts';
-import { BookOpen, ChevronLeft, MessageSquare, ShieldAlert, UserCheck } from 'lucide-react';
+import {
+  AlertTriangle,
+  BookOpen,
+  ChevronLeft,
+  MessageSquare,
+  ShieldAlert,
+  UserCheck,
+} from 'lucide-react';
 import { Link } from 'react-router-dom';
 import { mediaUrl } from '../lib/api-client';
 import { buildSpeechText, formatBengaliDate } from '../lib/format';
@@ -65,6 +72,26 @@ export function AnalysisResultView({ result }: { result: AnalysisResult }) {
                 <span>আপনার প্রশ্ন</span>
               </div>
               <p className="question-chip__text">{result.farmerQuestion}</p>
+            </div>
+          )}
+
+          {result.cropMismatch?.detected && (
+            <div className="notice mismatch-banner" role="alert">
+              <div>
+                <div className="notice__header">
+                  <AlertTriangle size={18} strokeWidth={2.2} aria-hidden="true" />
+                  <p className="notice__title">ফসলের অমিল শনাক্ত হয়েছে</p>
+                </div>
+                <p className="notice__text">{result.cropMismatch.messageBn}</p>
+                <div className="mismatch-banner__meta">
+                  <span className="badge badge--warn">
+                    ছবিতে: {result.cropMismatch.photoCropBn}
+                  </span>
+                  <span className="badge badge--warn">
+                    প্রশ্নে: {result.cropMismatch.questionCropBn}
+                  </span>
+                </div>
+              </div>
             </div>
           )}
 
@@ -199,7 +226,9 @@ export function AnalysisResultView({ result }: { result: AnalysisResult }) {
                 <p className="notice__text">
                   {uncertainty.isUncertain
                     ? 'রোগটি নিশ্চিতভাবে শনাক্ত করা যায়নি। আন্দাজে কোনো ওষুধ স্প্রে না করে সরাসরি স্থানীয় উপ-সহকারী কৃষি কর্মকর্তা (SAAO) অথবা উপজেলা কৃষি অফিসে যোগাযোগ করুন।'
-                    : 'এই রোগে সাধারণ ছত্রাকনাশক স্প্রে কার্যকর নয়। মাঠ পর্যায়ের সঠিক ব্যবস্থাপনার জন্য দ্রুত স্থানীয় উপ-সহকারী কৃষি কর্মকর্তা (SAAO)-এর সাথে পরামর্শ করুন।'}
+                    : result.cropMismatch?.detected
+                      ? 'ছবি ও প্রশ্নের ফসলে অমিল থাকায় সঠিক ফসল যাচাই করে ব্যবস্থা নিতে স্থানীয় উপ-সহকারী কৃষি কর্মকর্তা (SAAO) অথবা উপজেলা কৃষি অফিসে যোগাযোগ করুন।'
+                      : 'এই রোগে সাধারণ ছত্রাকনাশক স্প্রে কার্যকর নয়। মাঠ পর্যায়ের সঠিক ব্যবস্থাপনার জন্য দ্রুত স্থানীয় উপ-সহকারী কৃষি কর্মকর্তা (SAAO)-এর সাথে পরামর্শ করুন।'}
                 </p>
               </div>
             </div>

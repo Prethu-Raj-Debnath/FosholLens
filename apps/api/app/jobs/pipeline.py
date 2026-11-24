@@ -22,13 +22,25 @@ from .. import store
 from ..config import settings
 from ..grounding import knowledge_base, rag
 from ..grounding.districts import find_nearest_district, get_district
-from ..grounding.weather import fetch_weather
-from ..llm.audio_input import transcribe_bangla_question
+from ..grounding.geocoder import resolve_precise_location
+from ..grounding.weather import build_extension_office_bn, fetch_weather
+from ..llm.audio_input import (
+    QuestionContext,
+    extract_question_context,
+    extract_question_context_offline,
+    transcribe_bangla_question,
+)
 from ..llm.writer import InvalidNarrative, get_writer
 from ..tts.engine import TtsSafetyError, get_engine
 from ..vision import VisionFacts, get_classifier
 
 log = logging.getLogger(__name__)
+_DEFAULT_TRANSCRIBE = transcribe_bangla_question
+
+_CROP_BN_MAP: dict[str, str] = {
+    "rice": "ধান",
+    "potato": "আলু",
+}
 
 #: Which KB entry is used when the classifier cannot name the disease. Every
 #: crop still gets real, curated treatment; the result says it is unconfirmed.
@@ -142,6 +154,43 @@ def _combine_farmer_question(
     return combined[: settings.max_question_chars].strip() or None
 
 
+def _determine_photo_crop(crop_id: str, vision: VisionFacts) -> str:
+    vision_crop = vision.get("crop_id")
+    if isinstance(vision_crop, str) and vision_crop in knowledge_base.SUPPORTED_CROPS:
+        return vision_crop
+    label = str(vision.get("label") or "").strip().lower()
+    if label.startswith("potato"):
+        return "potato"
+    if label.startswith("rice"):
+        return "rice"
+    return crop_id
+
+
+def _build_crop_mismatch(
+    photo_crop: str,
+    question_ctx: QuestionContext,
+) -> dict[str, Any] | None:
+    if question_ctx.spoken_crop not in ("rice", "potato", "other"):
+        return None
+    if question_ctx.spoken_crop == photo_crop:
+        return None
+    photo_crop_bn = _CROP_BN_MAP.get(photo_crop, photo_crop)
+    question_crop_bn = question_ctx.spoken_crop_bn or _CROP_BN_MAP.get(
+        question_ctx.spoken_crop, "অন্য ফসল"
+    )
+    message_bn = (
+        f"ছবিতে {photo_crop_bn} পাতা দেখা যাচ্ছে, কিন্তু আপনার প্রশ্নে {question_crop_bn} "
+        "ফসলের কথা বলা হয়েছে। বিভ্রান্তি এড়াতে পরামর্শটি শুধুমাত্র ছবির ফসলের যাচাইকৃত "
+        "BARI/BRRI নির্দেশিকায় সীমাবদ্ধ রাখা হয়েছে।"
+    )
+    return {
+        "detected": True,
+        "photoCropBn": photo_crop_bn,
+        "questionCropBn": question_crop_bn,
+        "messageBn": message_bn,
+    }
+
+
 async def _pipeline(
     analysis_id: str,
     crop_id: str,
@@ -155,18 +204,37 @@ async def _pipeline(
 ) -> None:
     await store.update_stage(analysis_id, "reading", "processing")
 
-    if audio_bytes and audio_mime:
-        vision, transcribed_voice = await asyncio.gather(
-            _classify(analysis_id, crop_id),
-            transcribe_bangla_question(audio_bytes, audio_mime, settings),
+    has_audio = bool(audio_bytes and audio_mime)
+    has_text = bool(question_text and question_text.strip())
+
+    if transcribe_bangla_question is not _DEFAULT_TRANSCRIBE:
+        if has_audio:
+            vision, transcribed_voice = await asyncio.gather(
+                _classify(analysis_id, crop_id),
+                transcribe_bangla_question(audio_bytes, audio_mime, settings),  # type: ignore[arg-type]
+            )
+        else:
+            vision = await _classify(analysis_id, crop_id)
+            transcribed_voice = None
+        farmer_question = _combine_farmer_question(question_text, transcribed_voice)
+        question_ctx = extract_question_context_offline(
+            farmer_question, transcript_bn=transcribed_voice
         )
+    elif has_audio or has_text:
+        vision, question_ctx = await asyncio.gather(
+            _classify(analysis_id, crop_id),
+            extract_question_context(audio_bytes, audio_mime, question_text, settings),
+        )
+        farmer_question = _combine_farmer_question(question_text, question_ctx.transcript_bn)
     else:
         vision = await _classify(analysis_id, crop_id)
-        transcribed_voice = None
+        question_ctx = QuestionContext()
+        farmer_question = None
 
-    farmer_question = _combine_farmer_question(question_text, transcribed_voice)
+    photo_crop = _determine_photo_crop(crop_id, vision)
+    crop_mismatch = _build_crop_mismatch(photo_crop, question_ctx)
 
-    disease, confirmed = _resolve_disease(crop_id, vision)
+    disease, confirmed = _resolve_disease(photo_crop, vision)
     if disease is None:
         await store.mark_failed(analysis_id, "knowledge_base_miss")
         return
@@ -176,7 +244,40 @@ async def _pipeline(
     district = get_district(district_id) if district_id else None
     weather = None
     display_district: str | None = None
-    if latitude is not None and longitude is not None:
+    resolved_place: str | None = None
+    extension_office_bn: str | None = None
+
+    has_voice_location = bool(
+        question_ctx.spoken_place_en
+        or question_ctx.spoken_place_bn
+        or question_ctx.spoken_district_en
+    )
+    resolved_loc = None
+    if has_voice_location:
+        resolved_loc = await resolve_precise_location(
+            question_ctx.spoken_place_en,
+            question_ctx.spoken_place_bn,
+            question_ctx.spoken_district_en,
+            gps_lat=latitude,
+            gps_lon=longitude,
+            fallback_district_id=district_id,
+        )
+
+    if resolved_loc is not None:
+        resolved_place = resolved_loc.resolved_place
+        extension_office_bn = build_extension_office_bn(resolved_place)
+        weather = await fetch_weather(
+            latitude=resolved_loc.latitude,
+            longitude=resolved_loc.longitude,
+            district_id=resolved_loc.district_id,
+            district_name=resolved_loc.district_name,
+            location_source="voice",
+            resolved_place=resolved_place,
+            location_candidates=[c.as_contract_dict() for c in resolved_loc.candidates],
+            extension_office_bn=extension_office_bn,
+        )
+        display_district = resolved_loc.district_name
+    elif latitude is not None and longitude is not None:
         nearest = find_nearest_district(latitude, longitude)
         weather = await fetch_weather(
             latitude=latitude,
@@ -194,6 +295,12 @@ async def _pipeline(
         )
         display_district = str(district["name"])
 
+    if weather is not None:
+        if weather.resolved_place and not resolved_place:
+            resolved_place = weather.resolved_place
+        if weather.extension_office_bn and not extension_office_bn:
+            extension_office_bn = weather.extension_office_bn
+
     rag_disease_id = disease["id"] if confirmed else "uncertain"
     if confirmed:
         query_parts = [disease["diseaseLabel"], disease["bnName"], *disease["symptoms"][:2]]
@@ -201,12 +308,18 @@ async def _pipeline(
         query_parts = [disease["cropName"], "scouting", "SAAO", "clear photo"]
     if weather is not None and not weather.spray_window_ok:
         query_parts.append("rain wind spray warning")
-    rag_query = farmer_question if farmer_question else " ".join(query_parts)
+
+    # Hard RAG guard: on crop mismatch, never let the mismatched spoken crop
+    # influence retrieval; stick strictly to the photographed crop & diagnosis.
+    if crop_mismatch is not None:
+        rag_query = " ".join(query_parts)
+    else:
+        rag_query = farmer_question if farmer_question else " ".join(query_parts)
 
     grounding = await asyncio.to_thread(
         rag.retrieve_grounding_bundle,
         rag_disease_id,
-        disease["cropId"],
+        photo_crop,
         rag_query,
         3,
     )
@@ -218,6 +331,10 @@ async def _pipeline(
         confirmed=confirmed,
         grounding=grounding,
         farmer_question=farmer_question,
+        resolved_place=resolved_place,
+        spoken_plot_hint_bn=question_ctx.spoken_plot_hint_bn,
+        extension_office_bn=extension_office_bn,
+        crop_mismatch=crop_mismatch,
     )
 
     await store.update_stage(analysis_id, "writing")
@@ -234,6 +351,7 @@ async def _pipeline(
         grounding=grounding,
         farmer_question=farmer_question,
         district_name=display_district,
+        crop_mismatch=crop_mismatch,
     )
     await store.save_result(analysis_id, result, disease_id=disease["id"])
 
@@ -386,6 +504,10 @@ def _build_facts(
     confirmed: bool,
     grounding: rag.GroundingBundle,
     farmer_question: str | None = None,
+    resolved_place: str | None = None,
+    spoken_plot_hint_bn: str | None = None,
+    extension_office_bn: str | None = None,
+    crop_mismatch: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """The exact shape handed to the LLM. Facts only, no instructions.
 
@@ -401,7 +523,8 @@ def _build_facts(
         else (is_healthy or not disease["chemical"])
     )
     allow_chemicals = confirmed and not cultural_only and not is_healthy
-    refer_to_officer = (not confirmed) or grounding.refer_to_officer
+    mismatch_detected = bool(crop_mismatch and crop_mismatch.get("detected"))
+    refer_to_officer = (not confirmed) or grounding.refer_to_officer or mismatch_detected
 
     if not allow_chemicals:
         prompt_chemicals: list[dict[str, str]] = []
@@ -441,6 +564,23 @@ def _build_facts(
     if weather_facts is not None and not allow_chemicals:
         weather_facts["safest_window_summary_bn"] = None
 
+    pure_extension_bn = (
+        extension_office_bn.replace("(SAAO)", "").strip() if extension_office_bn else None
+    )
+    facts_mismatch = (
+        {
+            "detected": True,
+            "photo_crop_bn": crop_mismatch["photoCropBn"],
+            "question_crop_bn": crop_mismatch["questionCropBn"],
+            "note_bn": (
+                f"ছবিতে {crop_mismatch['photoCropBn']} পাতা দেখা যাচ্ছে, "
+                f"কিন্তু প্রশ্নে {crop_mismatch['questionCropBn']} ফসলের কথা বলা হয়েছে।"
+            ),
+        }
+        if mismatch_detected and crop_mismatch is not None
+        else None
+    )
+
     return {
         "diagnosis": {
             "crop": disease["cropName"],
@@ -462,6 +602,10 @@ def _build_facts(
         "weather": weather_facts,
         "uncertain": not confirmed,
         "farmer_question": farmer_question,
+        "resolved_place": resolved_place,
+        "spoken_plot_hint_bn": spoken_plot_hint_bn,
+        "extension_office_bn": pure_extension_bn,
+        "crop_mismatch": facts_mismatch,
         "rag_grounding": {
             "disease_id": grounding.normalized_disease_id or disease["id"],
             "cultural_only": cultural_only,
@@ -513,6 +657,7 @@ def _build_result(
     grounding: rag.GroundingBundle,
     farmer_question: str | None = None,
     district_name: str | None = None,
+    crop_mismatch: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     confidence = vision["confidence"]
     is_healthy = bool(vision.get("is_healthy")) or disease["id"].endswith("_healthy")
@@ -522,7 +667,8 @@ def _build_result(
         else (is_healthy or not disease["chemical"])
     )
     allow_chemicals = confirmed and not cultural_only and not is_healthy
-    refer_to_officer = (not confirmed) or grounding.refer_to_officer
+    mismatch_detected = bool(crop_mismatch and crop_mismatch.get("detected"))
+    refer_to_officer = (not confirmed) or grounding.refer_to_officer or mismatch_detected
     ppe_reminder = (
         grounding.ppe_reminder_bn if (allow_chemicals and grounding.ppe_reminder_bn) else None
     )
@@ -597,21 +743,8 @@ def _build_result(
         "narrative": narrative,
         "farmerQuestion": farmer_question,
         "generatedBy": generated_by,
-        "weather": (
-            {
-                "district": weather.district_name,
-                "rainProbabilityNext12h": weather.rain_probability,
-                "windSpeedMax12h": round(weather.wind_speed_max, 1),
-                "humidity": weather.humidity,
-                "sprayWindowOk": weather.spray_window_ok,
-                "reason": weather.reason,
-                "hourlyWindows": [w.as_contract_dict() for w in weather.hourly_windows],
-                "safestWindowSummaryBn": weather.safest_window_summary_bn,
-                "locationSource": weather.location_source,
-            }
-            if weather
-            else None
-        ),
+        "weather": weather.as_contract_dict() if weather else None,
+        "cropMismatch": crop_mismatch,
         "audio": {"status": "pending" if settings.tts_enabled else "none", "url": None},
         "district": district_name,
     }

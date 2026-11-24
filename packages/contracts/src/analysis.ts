@@ -85,9 +85,25 @@ export const SPRAY_SAFETIES = ['green', 'amber', 'red'] as const;
 export const SpraySafetySchema = z.enum(SPRAY_SAFETIES);
 export type SpraySafety = z.infer<typeof SpraySafetySchema>;
 
-export const LOCATION_SOURCES = ['gps', 'district'] as const;
+export const LOCATION_SOURCES = ['voice', 'gps', 'district'] as const;
 export const LocationSourceSchema = z.enum(LOCATION_SOURCES);
 export type LocationSource = z.infer<typeof LocationSourceSchema>;
+
+export const LocationCandidateSchema = z.object({
+  label: z.string(),
+  district: z.string(),
+  latitude: z.number(),
+  longitude: z.number(),
+});
+export type LocationCandidate = z.infer<typeof LocationCandidateSchema>;
+
+export const CropMismatchSchema = z.object({
+  detected: z.boolean(),
+  photoCropBn: z.string(),
+  questionCropBn: z.string(),
+  messageBn: z.string(),
+});
+export type CropMismatch = z.infer<typeof CropMismatchSchema>;
 
 export const HourlySprayWindowSchema = z.object({
   timeIso: z.string(),
@@ -109,6 +125,11 @@ export const WeatherSchema = z.object({
   hourlyWindows: z.array(HourlySprayWindowSchema).default([]),
   safestWindowSummaryBn: z.string().nullable().optional(),
   locationSource: LocationSourceSchema.default('district'),
+  resolvedPlace: z.string().nullable().optional(),
+  gridLatitude: z.number().nullable().optional(),
+  gridLongitude: z.number().nullable().optional(),
+  locationCandidates: z.array(LocationCandidateSchema).default([]),
+  extensionOfficeBn: z.string().nullable().optional(),
   source: z.string().optional(),
 });
 export type Weather = z.infer<typeof WeatherSchema>;
@@ -136,6 +157,7 @@ export const AnalysisResultSchema = z.object({
   /** 'template' means the LLM was unavailable and facts were composed directly. */
   generatedBy: z.enum(['llm', 'template']).default('template'),
   weather: WeatherSchema.nullable().optional(),
+  cropMismatch: CropMismatchSchema.nullable().optional(),
   audio: AudioInfoSchema.optional(),
   district: z.string().nullable().optional(),
 });

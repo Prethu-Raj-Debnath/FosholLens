@@ -27,7 +27,21 @@ AudioStatus = Literal["none", "pending", "ready", "failed"]
 GeneratedBy = Literal["llm", "template"]
 CropId = Literal["rice", "potato"]
 SpraySafety = Literal["green", "amber", "red"]
-LocationSource = Literal["gps", "district"]
+LocationSource = Literal["voice", "gps", "district"]
+
+
+class LocationCandidate(BaseModel):
+    label: str
+    district: str
+    latitude: float
+    longitude: float
+
+
+class CropMismatch(BaseModel):
+    detected: bool
+    photoCropBn: str
+    questionCropBn: str
+    messageBn: str
 
 
 class Diagnosis(BaseModel):
@@ -85,6 +99,11 @@ class Weather(BaseModel):
     hourlyWindows: list[HourlySprayWindow] = Field(default_factory=list)
     safestWindowSummaryBn: str | None = None
     locationSource: LocationSource = "district"
+    resolvedPlace: str | None = None
+    gridLatitude: float | None = None
+    gridLongitude: float | None = None
+    locationCandidates: list[LocationCandidate] = Field(default_factory=list)
+    extensionOfficeBn: str | None = None
     source: str = "Open-Meteo"
 
 
@@ -129,6 +148,7 @@ class AnalysisResult(BaseModel):
     farmerQuestion: str | None = None
     generatedBy: GeneratedBy = "template"
     weather: Weather | None = None
+    cropMismatch: CropMismatch | None = None
     audio: AudioInfo = Field(default_factory=AudioInfo)
     district: str | None = None
 

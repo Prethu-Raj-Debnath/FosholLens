@@ -27,9 +27,11 @@ from .contracts import (
     District,
     HealthResponse,
     TtsRequest,
+    Weather,
 )
 from .grounding import knowledge_base
-from .grounding.districts import DISTRICTS, get_district
+from .grounding.districts import DISTRICTS, find_nearest_district, get_district
+from .grounding.weather import fetch_weather
 from .jobs import pipeline
 from .tts.engine import (
     TtsSafetyError,
@@ -149,6 +151,35 @@ async def health() -> HealthResponse:
 @router.get("/districts", response_model=list[District])
 async def districts() -> list[District]:
     return [District(**district) for district in DISTRICTS]  # type: ignore[arg-type]
+
+
+@router.get("/weather", response_model=Weather)
+async def weather_lookup(
+    lat: float,
+    lon: float,
+    label: str | None = None,
+) -> Weather:
+    if not (
+        math.isfinite(lat)
+        and math.isfinite(lon)
+        and -90.0 <= lat <= 90.0
+        and -180.0 <= lon <= 180.0
+    ):
+        raise HTTPException(status_code=400, detail="invalid_coordinates")
+
+    nearest = find_nearest_district(lat, lon)
+    cleaned_label = " ".join((label or "").split()).strip()[:120] or None
+    facts = await fetch_weather(
+        latitude=lat,
+        longitude=lon,
+        district_id=str(nearest["id"]),
+        district_name=str(nearest["name"]),
+        location_source="voice" if cleaned_label else "gps",
+        resolved_place=cleaned_label or str(nearest["name"]),
+    )
+    if facts is None:
+        raise HTTPException(status_code=503, detail="weather_unavailable")
+    return Weather.model_validate(facts.as_contract_dict())
 
 
 @router.get("/crops")

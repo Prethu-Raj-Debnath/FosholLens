@@ -39,7 +39,7 @@ _EMOJI = re.compile(
 _WHITESPACE = re.compile(r"\s+")
 
 MIN_WORDS = 25
-MAX_WORDS = 90
+MAX_WORDS = 120
 
 
 class Writer(Protocol):
@@ -156,6 +156,15 @@ SYSTEM_PROMPT = """\
   এবং স্থানীয় উপ-সহকারী কৃষি কর্মকর্তার পরামর্শ নিতে বলবে।
 - তথ্যে কৃষকের প্রশ্ন থাকলে শুধু দেওয়া বারি/ব্রি তথ্য ও আবহাওয়ার ভিত্তিতে
   সরাসরি সেই প্রশ্নের উত্তর বাংলায় দেবে; উত্তর দিতে গিয়ে কোনো নতুন ওষুধ বানাবে না।
+- তথ্যে 'resolved_place' বা 'extension_office_bn' থাকলে পরামর্শে সেই এলাকার নাম উল্লেখ করবে
+  এবং ওই এলাকার স্থানীয় উপজেলা কৃষি অফিস ও উপ-সহকারী কৃষি কর্মকর্তার সাথে যোগাযোগের কথা বলবে
+  (সবসময় কেবল বাংলা অক্ষরে লিখবে, কোনো ইংরেজি অক্ষর লিখবে না)।
+- তথ্যে 'spoken_plot_hint_bn' থাকলে জমির সেই অবস্থা অনুযায়ী (যেমন নিচু জমি বা পুকুরের পাশে হলে
+  দ্রুত পানি নিষ্কাশন ও জলাবদ্ধতা এড়ানো) সংক্ষিপ্ত ব্যবহারিক পরামর্শ যোগ করবে।
+- তথ্যে 'crop_mismatch' সত্য হলে প্রথমেই বাংলায় স্পষ্ট জানাবে যে ছবির পাতা এবং প্রশ্নের ফসল আলাদা,
+  তাই কেবল ছবির ফসলের অনুমোদিত বারি/ব্রি নির্দেশিকা থেকেই পরামর্শ দেওয়া হচ্ছে;
+  প্রশ্নের অন্য ফসলের কোনো ওষুধ বা পরামর্শ দেবে না এবং কৃষককে সঠিক ফসল নিশ্চিত করতে বা
+  মিল থাকা পাতার ছবি দিতে বলবে।
 """
 
 DEFAULT_GEMINI_MODEL = "gemini-3.5-flash-lite"
@@ -216,6 +225,11 @@ def _build_user_prompt(facts: dict[str, Any], allowed: list[str], *, is_retry: b
     )
     if not allowed:
         retry_note += " কোনো ওষুধ, ছত্রাকনাশক বা রাসায়নিকের নাম উল্লেখ করবে না।"
+    if (facts.get("crop_mismatch") or {}).get("detected"):
+        retry_note += (
+            " ফসলের অমিল থাকায় কেবল ছবির ফসলের তথ্যই ব্যবহার করবে, "
+            "প্রশ্নের অন্য ফসলের কোনো ওষুধ বা পরামর্শ দেবে না।"
+        )
     return f"{retry_note}\n\nতথ্য:\n{payload}"
 
 
@@ -446,6 +460,14 @@ class LlmWriter:
         return validate_narrative(spoken, allowed)
 
 
+def _bangla_only(text: str) -> str:
+    """Strip stray Latin spans/empty parens so TemplateWriter never emits Latin for TTS."""
+    cleaned = re.sub(r"[A-Za-z]+", " ", normalise(text))
+    cleaned = re.sub(r"\(\s*\)", "", cleaned)
+    cleaned = re.sub(r"\s*,\s*", ", ", cleaned).strip(" ,")
+    return normalise(cleaned)
+
+
 class TemplateWriter:
     """Composes the narrative from facts alone. No network, no model, no risk."""
 
@@ -462,9 +484,26 @@ class TemplateWriter:
         is_healthy = bool(diagnosis.get("healthy")) or bool(rag_grounding.get("is_healthy"))
         refer_to_officer = bool(rag_grounding.get("refer_to_officer"))
         has_question = bool(str(facts.get("farmer_question") or "").strip())
+        crop_mismatch = facts.get("crop_mismatch") or {}
+        mismatch_detected = bool(crop_mismatch.get("detected"))
+        resolved_place = facts.get("resolved_place")
+        plot_hint_bn = facts.get("spoken_plot_hint_bn")
+        extension_office_bn = facts.get("extension_office_bn")
 
         parts: list[str] = []
-        if has_question:
+        if mismatch_detected:
+            photo_crop_bn = _bangla_only(
+                str(crop_mismatch.get("photo_crop_bn") or diagnosis["crop"])
+            )
+            question_crop_bn = _bangla_only(
+                str(crop_mismatch.get("question_crop_bn") or "অন্য ফসল")
+            )
+            parts.append(
+                f"সতর্কতা: ছবিতে {photo_crop_bn} পাতা দেখা যাচ্ছে, কিন্তু আপনার প্রশ্নে {question_crop_bn} "
+                f"ফসলের কথা বলা হয়েছে। বিভ্রান্তি এড়াতে কেবল ছবির {photo_crop_bn} ফসলের "
+                "যাচাইকৃত নির্দেশিকা থেকেই পরামর্শ দিচ্ছি।"
+            )
+        elif has_question:
             parts.append("আপনার প্রশ্নের প্রেক্ষিতে জানাচ্ছি,")
 
         if uncertain:
@@ -519,6 +558,33 @@ class TemplateWriter:
                 safest = weather.get("safest_window_summary_bn")
                 if safest and not cultural_only and not uncertain:
                     parts.append(f"{safest}।")
+
+        if plot_hint_bn:
+            safe_hint = _bangla_only(str(plot_hint_bn))
+            if safe_hint:
+                if any(
+                    kw in safe_hint
+                    for kw in ("নিচু", "পুকুর", "জলাবদ্ধ", "পানি", "খাল", "বিল", "হাওর")
+                ):
+                    parts.append(
+                        f"আপনার {safe_hint} হওয়ায় দ্রুত পানি নিষ্কাশন ও জলাবদ্ধতা এড়ানোর ব্যবস্থা রাখুন।"
+                    )
+                else:
+                    parts.append(
+                        f"আপনার {safe_hint} বিবেচনায় নিয়মিত ক্ষেত পর্যবেক্ষণ ও পরিচর্যা বজায় রাখুন।"
+                    )
+
+        if extension_office_bn or resolved_place:
+            raw_office = str(
+                extension_office_bn
+                or f"{resolved_place} এলাকার উপজেলা কৃষি অফিস ও উপ-সহকারী কৃষি কর্মকর্তা"
+            )
+            safe_office = _bangla_only(raw_office)
+            if safe_office:
+                parts.append(f"মাঠ পর্যায়ের সহায়তার জন্য {safe_office}-এর সাথে যোগাযোগ করুন।")
+
+        if mismatch_detected:
+            parts.append("অনুগ্রহ করে সঠিক ফসল নিশ্চিত করুন অথবা মিল থাকা পাতার নতুন ছবি দিন।")
 
         return normalise(" ".join(parts))
 

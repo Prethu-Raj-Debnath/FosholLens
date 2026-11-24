@@ -11,7 +11,7 @@ from __future__ import annotations
 import logging
 import math
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date, datetime, timedelta, timezone, tzinfo
 from typing import Any, Literal
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -64,7 +64,22 @@ def _parse_dhaka_dt(raw: str) -> datetime:
     return parsed.astimezone(tz)
 
 SpraySafety = Literal["green", "amber", "red"]
-LocationSource = Literal["gps", "district"]
+LocationSource = Literal["voice", "gps", "district"]
+
+
+def build_extension_office_bn(place_label: str) -> str:
+    """Format the local Upazila Agriculture Office / SAAO guidance string in Bangla."""
+    return f"{place_label} এলাকার উপজেলা কৃষি অফিস ও উপ-সহকারী কৃষি কর্মকর্তা (SAAO)"
+
+
+def _finite_coord(value: Any) -> float | None:
+    if isinstance(value, bool) or value is None:
+        return None
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    return round(parsed, 4) if math.isfinite(parsed) else None
 
 
 @dataclass(frozen=True, slots=True)
@@ -97,10 +112,15 @@ class WeatherFacts:
     hourly_windows: tuple[HourlySprayWindow, ...] = ()
     safest_window_summary_bn: str | None = None
     location_source: LocationSource = "district"
+    resolved_place: str | None = None
+    grid_latitude: float | None = None
+    grid_longitude: float | None = None
+    location_candidates: tuple[dict[str, Any], ...] = ()
+    extension_office_bn: str | None = None
 
     def as_prompt_facts(self) -> dict[str, Any]:
         """The shape handed to the LLM. Facts only, no instructions."""
-        return {
+        facts: dict[str, Any] = {
             "district": self.district_name,
             "rain_probability_next_12h": self.rain_probability,
             "wind_speed_max_next_12h": round(self.wind_speed_max, 1),
@@ -108,6 +128,27 @@ class WeatherFacts:
             "spray_window_ok": self.spray_window_ok,
             "reason": self.reason,
             "safest_window_summary_bn": self.safest_window_summary_bn,
+        }
+        if self.resolved_place:
+            facts["resolved_place"] = self.resolved_place
+        return facts
+
+    def as_contract_dict(self) -> dict[str, Any]:
+        return {
+            "district": self.district_name,
+            "rainProbabilityNext12h": self.rain_probability,
+            "windSpeedMax12h": round(self.wind_speed_max, 1),
+            "humidity": self.humidity,
+            "sprayWindowOk": self.spray_window_ok,
+            "reason": self.reason,
+            "hourlyWindows": [w.as_contract_dict() for w in self.hourly_windows],
+            "safestWindowSummaryBn": self.safest_window_summary_bn,
+            "locationSource": self.location_source,
+            "resolvedPlace": self.resolved_place,
+            "gridLatitude": self.grid_latitude,
+            "gridLongitude": self.grid_longitude,
+            "locationCandidates": list(self.location_candidates),
+            "extensionOfficeBn": self.extension_office_bn,
         }
 
 
@@ -334,11 +375,17 @@ def classify(
     *,
     now: datetime | None = None,
     location_source: LocationSource = "district",
+    resolved_place: str | None = None,
+    location_candidates: tuple[dict[str, Any], ...] = (),
+    extension_office_bn: str | None = None,
 ) -> WeatherFacts | None:
     """Turn an Open-Meteo response into facts. Split out so it is testable."""
     raw_hourly = payload.get("hourly") if isinstance(payload, dict) else None
     if not isinstance(raw_hourly, dict) or not raw_hourly:
         return None
+
+    grid_lat = _finite_coord(payload.get("latitude")) if isinstance(payload, dict) else None
+    grid_lon = _finite_coord(payload.get("longitude")) if isinstance(payload, dict) else None
 
     tz = _dhaka_tz()
     if now is None:
@@ -373,6 +420,9 @@ def classify(
     safest_summary = _compute_safest_window_summary_bn(
         windows, reference_date=current_hour.date()
     )
+    effective_extension = extension_office_bn or (
+        build_extension_office_bn(resolved_place) if resolved_place else None
+    )
 
     return WeatherFacts(
         district_id=district_id,
@@ -385,6 +435,11 @@ def classify(
         hourly_windows=windows,
         safest_window_summary_bn=safest_summary,
         location_source=location_source,
+        resolved_place=resolved_place,
+        grid_latitude=grid_lat,
+        grid_longitude=grid_lon,
+        location_candidates=location_candidates,
+        extension_office_bn=effective_extension,
     )
 
 
@@ -395,6 +450,9 @@ async def fetch_weather(
     district_name: str | None = None,
     *,
     location_source: LocationSource | None = None,
+    resolved_place: str | None = None,
+    location_candidates: list[dict[str, Any]] | tuple[dict[str, Any], ...] = (),
+    extension_office_bn: str | None = None,
 ) -> WeatherFacts | None:
     """Fetch 48h of future weather. Returns None on any failure - weather is optional.
 
@@ -420,7 +478,28 @@ async def fetch_weather(
     else:
         resolved_source = "district"
 
-    if resolved_source == "gps":
+    cleaned_place = (resolved_place or "").strip() or None
+    candidates_tuple = tuple(location_candidates)
+    effective_place: str | None
+    effective_extension: str | None
+
+    if resolved_source == "voice":
+        if latitude is None or longitude is None:
+            known = get_district(district_id) if district_id else None
+            if known is None:
+                return None
+            req_lat = float(str(known["latitude"]))
+            req_lon = float(str(known["longitude"]))
+        else:
+            req_lat = latitude
+            req_lon = longitude
+        nearest = find_nearest_district(req_lat, req_lon)
+        resolved_district_id = district_id or str(nearest["id"])
+        resolved_district_name = district_name or str(nearest["name"])
+        effective_place = cleaned_place or resolved_district_name
+        effective_extension = extension_office_bn or build_extension_office_bn(effective_place)
+        cache_prefix = f"voice:{req_lat:.2f},{req_lon:.2f}"
+    elif resolved_source == "gps":
         if latitude is None or longitude is None:
             return None
         req_lat = latitude
@@ -428,6 +507,10 @@ async def fetch_weather(
         nearest = find_nearest_district(req_lat, req_lon)
         resolved_district_id = str(nearest["id"])
         resolved_district_name = f"{nearest['name']} (সঠিক অবস্থান)"
+        effective_place = cleaned_place
+        effective_extension = extension_office_bn or (
+            build_extension_office_bn(effective_place) if effective_place else None
+        )
         cache_prefix = f"gps:{req_lat:.2f},{req_lon:.2f}"
     else:
         known = get_district(district_id) if district_id else None
@@ -445,13 +528,25 @@ async def fetch_weather(
             req_lon = float(str(known["longitude"]))
             resolved_district_id = str(known["id"])
             resolved_district_name = district_name or str(known["name"])
+        effective_place = cleaned_place
+        effective_extension = extension_office_bn or (
+            build_extension_office_bn(effective_place) if effective_place else None
+        )
         cache_prefix = resolved_district_id
 
     current_hour = _current_dhaka_hour()
     cache_key = f"{cache_prefix}:{current_hour.isoformat()}"
     cached = _cache.get(cache_key)
     if cached and time.monotonic() - cached[0] < _cache_seconds:
-        return cached[1]
+        return replace(
+            cached[1],
+            district_id=resolved_district_id,
+            district_name=resolved_district_name,
+            location_source=resolved_source,
+            resolved_place=effective_place,
+            location_candidates=candidates_tuple,
+            extension_office_bn=effective_extension,
+        )
 
     params: dict[str, str | int | float] = {
         "latitude": req_lat,
@@ -471,6 +566,9 @@ async def fetch_weather(
                 resolved_district_name,
                 now=current_hour,
                 location_source=resolved_source,
+                resolved_place=effective_place,
+                location_candidates=candidates_tuple,
+                extension_office_bn=effective_extension,
             )
     except (httpx.HTTPError, KeyError, TypeError, ValueError) as exc:
         # `str(ConnectTimeout())` is empty, so a bare %s logs nothing useful.

@@ -1754,3 +1754,121 @@ ul {
 .speak-btn__retry:hover {
   background: var(--surface-hover);
 }
+
+/* --------------------- voice geocoding, grid, candidates & crop mismatch -- */
+
+.voice-location-badge {
+  display: inline-flex;
+  margin-top: 5px;
+  margin-bottom: 4px;
+  padding: 3px 10px;
+  align-items: center;
+  gap: 5px;
+  border-radius: 999px;
+  background: var(--green-100);
+  color: var(--green-800);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.weather-grid-meta,
+.weather-extension-office {
+  display: flex;
+  margin-top: 8px;
+  align-items: flex-start;
+  gap: 6px;
+  color: var(--ink-body);
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.weather-grid-meta svg,
+.weather-extension-office svg {
+  flex: none;
+  margin-top: 3px;
+  color: var(--green-700);
+}
+
+.location-candidates {
+  margin-top: 12px;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+}
+
+.location-candidates__label {
+  color: var(--muted);
+  font-size: 12.5px;
+  font-weight: 700;
+}
+
+.location-candidates__chips {
+  display: flex;
+  margin-top: 7px;
+  flex-wrap: wrap;
+  gap: 7px;
+}
+
+.location-chip {
+  padding: 5px 12px;
+  border: 1px solid var(--border-strong);
+  border-radius: 999px;
+  background: var(--surface-sunken);
+  color: var(--ink);
+  font-size: 12.5px;
+  font-weight: 600;
+  transition:
+    background-color 150ms ease,
+    border-color 150ms ease,
+    color 150ms ease;
+}
+
+.location-chip:hover:not(:disabled) {
+  border-color: var(--green-600);
+  background: var(--green-50);
+  color: var(--green-800);
+}
+
+.location-chip--active {
+  border-color: var(--green-700);
+  background: var(--green-700);
+  color: #fff;
+}
+
+.location-chip--active:hover:not(:disabled) {
+  border-color: var(--green-800);
+  background: var(--green-800);
+  color: #fff;
+}
+
+.location-chip:disabled {
+  opacity: 0.7;
+  cursor: wait;
+}
+
+.location-candidates__error {
+  margin-top: 6px;
+  color: var(--error-ink);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.mismatch-banner {
+  border-width: 1.5px;
+  border-color: #e4b756;
+  background: var(--warn-bg);
+  color: var(--warn-ink);
+}
+
+.mismatch-banner__meta {
+  display: flex;
+  margin-top: 8px;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.mismatch-banner__meta .badge--warn {
+  border: 1px solid var(--warn-border);
+  background: var(--surface);
+}
