@@ -632,3 +632,170 @@ async def test_gemini_writer_rejects_cross_crop_chemical_during_mismatch() -> No
     assert "ম্যানকোজেব" not in text
     assert len(prompts) == 2
     assert "ফসলের অমিল" in prompts[1]
+
+
+# ---------------------------------------------------------------------------
+# 5. Cross-crop unmasked photo detection (e.g. Potato photo + Rice selection)
+# ---------------------------------------------------------------------------
+
+
+def _probs(**weights: float):
+    import numpy as np
+
+    from app.vision.models import EFFICIENTNET
+
+    vector = np.zeros(len(EFFICIENTNET["labels"]), dtype=np.float32)
+    for label, weight in weights.items():
+        vector[EFFICIENTNET["labels"].index(label)] = weight
+    return vector
+
+
+def test_classifier_decide_exposes_unmasked_crop_override_without_breaking_scoped_status() -> None:
+    import numpy as np
+
+    from app.vision.classifier import _decide
+    from app.vision.models import EFFICIENTNET
+
+    # Potato leaf uploaded while crop="rice" is selected.
+    potato_under_rice = _decide(
+        _probs(potato_late_blight=0.92, potato_early_blight=0.05, rice_blast=0.01),
+        "rice",
+        EFFICIENTNET,
+    )
+    assert potato_under_rice["status"] == "undetermined"
+    assert potato_under_rice["raw_top_label"] == "potato_late_blight"
+    assert potato_under_rice["raw_top_confidence"] == pytest.approx(0.92)
+    assert potato_under_rice["inferred_photo_crop"] == "potato"
+    assert potato_under_rice["effective_crop"] == "potato"
+    assert potato_under_rice["crop_override_detected"] is True
+    assert potato_under_rice["override_disease_id"] == "potato_late_blight"
+    assert potato_under_rice["override_is_healthy"] is False
+    assert potato_under_rice["override_confirmed"] is True
+
+    # Rice leaf uploaded while crop="potato" is selected.
+    rice_under_potato = _decide(
+        _probs(rice_blast=0.88, rice_healthy=0.05, potato_healthy=0.02),
+        "potato",
+        EFFICIENTNET,
+    )
+    assert rice_under_potato["status"] == "undetermined"
+    assert rice_under_potato["inferred_photo_crop"] == "rice"
+    assert rice_under_potato["crop_override_detected"] is True
+    assert rice_under_potato["override_disease_id"] == "rice_blast"
+    assert rice_under_potato["override_confirmed"] is True
+
+    # Uniform noise (0.125 across 8 classes -> 5 rice classes sum to 0.625) must NOT infer rice.
+    uniform = np.full(len(EFFICIENTNET["labels"]), 1.0 / len(EFFICIENTNET["labels"]))
+    noise = _decide(uniform, "potato", EFFICIENTNET)
+    assert noise["inferred_photo_crop"] is None
+    assert noise["crop_override_detected"] is False
+
+
+def test_cross_crop_potato_photo_under_rice_selection_and_rice_question(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from app.vision.classifier import _decide
+    from app.vision.models import EFFICIENTNET
+
+    potato_under_rice = _decide(
+        _probs(potato_late_blight=0.92, potato_early_blight=0.04, rice_blast=0.01),
+        "rice",
+        EFFICIENTNET,
+    )
+
+    async def fake_classify(self, _path, _crop):
+        return potato_under_rice
+
+    monkeypatch.setattr(settings, "vision_enabled", True)
+    monkeypatch.setattr(
+        pipeline.get_classifier().__class__, "classify", fake_classify, raising=False
+    )
+
+    created = client.post(
+        "/api/v1/analyses",
+        files={"image": ("potato.jpg", _jpeg(), "image/jpeg")},
+        data={
+            "crop": "rice",
+            "question_text": "আমার ধানের পাতায় দাগ হয়েছে, কোন ওষুধ স্প্রে করব?",
+        },
+    )
+    assert created.status_code == 202
+    analysis_id = created.json()["id"]
+    _wait(client, analysis_id)
+
+    result = AnalysisResult.model_validate(
+        client.get(f"/api/v1/analyses/{analysis_id}/result").json()
+    )
+    assert result.uncertainty.isUncertain is False
+    assert result.cropName == "আলু"
+    assert result.diagnosis is not None
+    assert result.diagnosis.diseaseLabel == "আলুর নাবি ধসা রোগ"
+    assert result.diagnosis.confidence == pytest.approx(0.92)
+    assert result.cropMismatch is not None
+    assert result.cropMismatch.detected is True
+    assert result.cropMismatch.photoCropBn == "আলু"
+    assert result.cropMismatch.questionCropBn == "ধান"
+    assert "আলু" in result.cropMismatch.messageBn
+    assert "ধান" in result.cropMismatch.messageBn
+    assert result.referToOfficer is True
+
+    # Strictly BARI Potato RAG chunks (zero BRRI Rice chunks).
+    assert len(result.ragSources) >= 1
+    assert all(src.diseaseId == "potato_late_blight" for src in result.ragSources)
+    assert all("BARI" in src.sourceTitle for src in result.ragSources)
+    assert all("BRRI" not in src.sourceTitle for src in result.ragSources)
+
+    # Zero rice chemicals in treatment steps or narrative, and TTS-safe pure Bangla.
+    steps_blob = " ".join(result.treatment.steps) if result.treatment else ""
+    for rice_chem in ("ট্রাইসাইক্লাজল", "আইসোপ্রোথায়োলেন", "প্রোপিকোনাজল"):
+        assert rice_chem not in steps_blob
+        assert rice_chem not in result.narrative
+    assert not _LATIN_RE.search(result.narrative)
+    assert prepare_text(result.narrative)
+
+
+def test_cross_crop_potato_photo_under_rice_dropdown_without_question(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from app.vision.classifier import _decide
+    from app.vision.models import EFFICIENTNET
+
+    potato_under_rice = _decide(
+        _probs(potato_early_blight=0.89, potato_late_blight=0.05, rice_healthy=0.01),
+        "rice",
+        EFFICIENTNET,
+    )
+
+    async def fake_classify(self, _path, _crop):
+        return potato_under_rice
+
+    monkeypatch.setattr(settings, "vision_enabled", True)
+    monkeypatch.setattr(
+        pipeline.get_classifier().__class__, "classify", fake_classify, raising=False
+    )
+
+    created = client.post(
+        "/api/v1/analyses",
+        files={"image": ("potato_early.jpg", _jpeg(), "image/jpeg")},
+        data={"crop": "rice"},
+    )
+    assert created.status_code == 202
+    analysis_id = created.json()["id"]
+    _wait(client, analysis_id)
+
+    result = AnalysisResult.model_validate(
+        client.get(f"/api/v1/analyses/{analysis_id}/result").json()
+    )
+    assert result.uncertainty.isUncertain is False
+    assert result.cropName == "আলু"
+    assert result.diagnosis is not None
+    assert result.diagnosis.diseaseLabel == "আলুর আগাম ধসা রোগ"
+    assert result.cropMismatch is not None
+    assert result.cropMismatch.detected is True
+    assert result.cropMismatch.photoCropBn == "আলু"
+    assert result.cropMismatch.questionCropBn == "ধান"
+    assert result.referToOfficer is True
+    assert len(result.ragSources) >= 1
+    assert all(src.diseaseId == "potato_early_blight" for src in result.ragSources)
+    assert not _LATIN_RE.search(result.narrative)
+

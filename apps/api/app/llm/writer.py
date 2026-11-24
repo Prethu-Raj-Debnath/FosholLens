@@ -498,10 +498,15 @@ class TemplateWriter:
             question_crop_bn = _bangla_only(
                 str(crop_mismatch.get("question_crop_bn") or "অন্য ফসল")
             )
+            source_label_bn = (
+                "প্রশ্ন বা নির্বাচনে"
+                if crop_mismatch.get("selection_mismatch")
+                else "আপনার প্রশ্নে"
+            )
             parts.append(
-                f"সতর্কতা: ছবিতে {photo_crop_bn} পাতা দেখা যাচ্ছে, কিন্তু আপনার প্রশ্নে {question_crop_bn} "
-                f"ফসলের কথা বলা হয়েছে। বিভ্রান্তি এড়াতে কেবল ছবির {photo_crop_bn} ফসলের "
-                "যাচাইকৃত নির্দেশিকা থেকেই পরামর্শ দিচ্ছি।"
+                f"সতর্কতা: ছবিতে {photo_crop_bn} পাতা দেখা যাচ্ছে, কিন্তু {source_label_bn} "
+                f"{question_crop_bn} ফসলের কথা বলা হয়েছে। বিভ্রান্তি এড়াতে কেবল ছবির "
+                f"{photo_crop_bn} ফসলের যাচাইকৃত নির্দেশিকা থেকেই পরামর্শ দিচ্ছি।"
             )
         elif has_question:
             parts.append("আপনার প্রশ্নের প্রেক্ষিতে জানাচ্ছি,")

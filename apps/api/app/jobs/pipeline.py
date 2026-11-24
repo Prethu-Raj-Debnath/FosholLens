@@ -155,6 +155,9 @@ def _combine_farmer_question(
 
 
 def _determine_photo_crop(crop_id: str, vision: VisionFacts) -> str:
+    inferred_crop = vision.get("inferred_photo_crop")
+    if isinstance(inferred_crop, str) and inferred_crop in knowledge_base.SUPPORTED_CROPS:
+        return inferred_crop
     vision_crop = vision.get("crop_id")
     if isinstance(vision_crop, str) and vision_crop in knowledge_base.SUPPORTED_CROPS:
         return vision_crop
@@ -166,23 +169,70 @@ def _determine_photo_crop(crop_id: str, vision: VisionFacts) -> str:
     return crop_id
 
 
+def _effective_vision_for_diagnosis(vision: VisionFacts, photo_crop: str) -> VisionFacts:
+    """Promote a clear cross-crop unmasked detection so diagnosis/RAG match the photo."""
+    if (
+        vision.get("crop_override_detected")
+        and vision.get("override_confirmed")
+        and vision.get("override_disease_id")
+    ):
+        promoted: VisionFacts = {
+            **vision,
+            "status": "identified",
+            "label": vision.get("raw_top_label"),
+            "confidence": vision.get("raw_top_confidence"),
+            "crop_id": photo_crop,
+            "disease_id": vision.get("override_disease_id"),
+            "is_healthy": bool(vision.get("override_is_healthy")),
+        }
+        return promoted
+    return vision
+
+
 def _build_crop_mismatch(
     photo_crop: str,
+    selected_crop: str,
     question_ctx: QuestionContext,
+    vision: VisionFacts,
 ) -> dict[str, Any] | None:
-    if question_ctx.spoken_crop not in ("rice", "potato", "other"):
+    spoken_differs = (
+        question_ctx.spoken_crop in ("rice", "potato", "other")
+        and question_ctx.spoken_crop != photo_crop
+    )
+    inferred_crop = vision.get("inferred_photo_crop")
+    dropdown_differs = bool(
+        isinstance(inferred_crop, str)
+        and inferred_crop in knowledge_base.SUPPORTED_CROPS
+        and inferred_crop != selected_crop
+    )
+    if not spoken_differs and not dropdown_differs:
         return None
-    if question_ctx.spoken_crop == photo_crop:
-        return None
+
     photo_crop_bn = _CROP_BN_MAP.get(photo_crop, photo_crop)
-    question_crop_bn = question_ctx.spoken_crop_bn or _CROP_BN_MAP.get(
-        question_ctx.spoken_crop, "অন্য ফসল"
+    leaf_phrase = (
+        "ধানের পাতা"
+        if photo_crop == "rice"
+        else ("আলুর পাতা" if photo_crop == "potato" else f"{photo_crop_bn} পাতা")
     )
-    message_bn = (
-        f"ছবিতে {photo_crop_bn} পাতা দেখা যাচ্ছে, কিন্তু আপনার প্রশ্নে {question_crop_bn} "
-        "ফসলের কথা বলা হয়েছে। বিভ্রান্তি এড়াতে পরামর্শটি শুধুমাত্র ছবির ফসলের যাচাইকৃত "
-        "BARI/BRRI নির্দেশিকায় সীমাবদ্ধ রাখা হয়েছে।"
-    )
+    if spoken_differs:
+        question_crop_bn = question_ctx.spoken_crop_bn or _CROP_BN_MAP.get(
+            question_ctx.spoken_crop, "অন্য ফসল"
+        )
+    else:
+        question_crop_bn = _CROP_BN_MAP.get(selected_crop, selected_crop)
+
+    if dropdown_differs:
+        message_bn = (
+            f"ছবিতে {leaf_phrase} দেখা যাচ্ছে, কিন্তু প্রশ্নে/নির্বাচনে {question_crop_bn} "
+            "ফসলের কথা বলা হয়েছে। বিভ্রান্তি এড়াতে পরামর্শটি শুধুমাত্র ছবির ফসলের যাচাইকৃত "
+            "BARI/BRRI নির্দেশিকায় সীমাবদ্ধ রাখা হয়েছে।"
+        )
+    else:
+        message_bn = (
+            f"ছবিতে {leaf_phrase} দেখা যাচ্ছে, কিন্তু আপনার প্রশ্নে {question_crop_bn} "
+            "ফসলের কথা বলা হয়েছে। বিভ্রান্তি এড়াতে পরামর্শটি শুধুমাত্র ছবির ফসলের যাচাইকৃত "
+            "BARI/BRRI নির্দেশিকায় সীমাবদ্ধ রাখা হয়েছে।"
+        )
     return {
         "detected": True,
         "photoCropBn": photo_crop_bn,
@@ -232,9 +282,10 @@ async def _pipeline(
         farmer_question = None
 
     photo_crop = _determine_photo_crop(crop_id, vision)
-    crop_mismatch = _build_crop_mismatch(photo_crop, question_ctx)
+    effective_vision = _effective_vision_for_diagnosis(vision, photo_crop)
+    crop_mismatch = _build_crop_mismatch(photo_crop, crop_id, question_ctx, vision)
 
-    disease, confirmed = _resolve_disease(photo_crop, vision)
+    disease, confirmed = _resolve_disease(photo_crop, effective_vision)
     if disease is None:
         await store.mark_failed(analysis_id, "knowledge_base_miss")
         return
@@ -327,7 +378,7 @@ async def _pipeline(
     facts = _build_facts(
         disease,
         weather,
-        vision,
+        effective_vision,
         confirmed=confirmed,
         grounding=grounding,
         farmer_question=farmer_question,
@@ -346,7 +397,7 @@ async def _pipeline(
         weather,
         narrative,
         generated_by,
-        vision=vision,
+        vision=effective_vision,
         confirmed=confirmed,
         grounding=grounding,
         farmer_question=farmer_question,
@@ -572,9 +623,10 @@ def _build_facts(
             "detected": True,
             "photo_crop_bn": crop_mismatch["photoCropBn"],
             "question_crop_bn": crop_mismatch["questionCropBn"],
+            "selection_mismatch": "নির্বাচনে" in str(crop_mismatch.get("messageBn", "")),
             "note_bn": (
                 f"ছবিতে {crop_mismatch['photoCropBn']} পাতা দেখা যাচ্ছে, "
-                f"কিন্তু প্রশ্নে {crop_mismatch['questionCropBn']} ফসলের কথা বলা হয়েছে।"
+                f"কিন্তু প্রশ্ন বা নির্বাচনে {crop_mismatch['questionCropBn']} ফসলের কথা বলা হয়েছে।"
             ),
         }
         if mismatch_detected and crop_mismatch is not None

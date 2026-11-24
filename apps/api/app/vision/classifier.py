@@ -18,7 +18,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from pathlib import Path
-from typing import Any, Literal, TypedDict
+from typing import Any, Literal, NotRequired, TypedDict
 
 from ..config import settings
 from .models import EFFICIENTNET, ModelSpec
@@ -26,6 +26,9 @@ from .models import EFFICIENTNET, ModelSpec
 log = logging.getLogger(__name__)
 
 VisionStatus = Literal["identified", "undetermined", "unavailable"]
+
+UNMASKED_CROP_MASS_THRESHOLD = 0.60
+UNMASKED_TOP_CONFIDENCE_FLOOR = 0.25
 
 
 class VisionFacts(TypedDict):
@@ -44,6 +47,15 @@ class VisionFacts(TypedDict):
     #: Which checkpoint produced this, so a stored result stays interpretable
     #: after the checkpoint changes.
     model: str | None
+    #: Unmasked global predictions across all classes (before crop masking).
+    raw_top_label: NotRequired[str | None]
+    raw_top_confidence: NotRequired[float | None]
+    inferred_photo_crop: NotRequired[str | None]
+    effective_crop: NotRequired[str | None]
+    crop_override_detected: NotRequired[bool]
+    override_disease_id: NotRequired[str | None]
+    override_is_healthy: NotRequired[bool]
+    override_confirmed: NotRequired[bool]
 
 
 class LeafClassifier:
@@ -193,6 +205,81 @@ def _softmax(logits: Any) -> Any:
     return exponents / exponents.sum()
 
 
+def _unmasked_crop_signal(
+    probs: Any,
+    ranked: Any,
+    crop_id: str,
+    spec: ModelSpec,
+) -> dict[str, Any]:
+    """Compute global unmasked softmax crop mass & override metadata across all classes."""
+    labels = spec["labels"]
+    raw_top_index = int(ranked[0])
+    raw_top_label = labels[raw_top_index]
+    raw_top_confidence = float(probs[raw_top_index])
+
+    potato_mass = float(
+        sum(float(probs[i]) for i, lbl in enumerate(labels) if lbl.startswith("potato_"))
+    )
+    rice_mass = float(
+        sum(float(probs[i]) for i, lbl in enumerate(labels) if lbl.startswith("rice_"))
+    )
+
+    inferred_photo_crop: str | None = None
+    if (
+        potato_mass >= UNMASKED_CROP_MASS_THRESHOLD
+        and raw_top_label.startswith("potato_")
+        and raw_top_confidence >= UNMASKED_TOP_CONFIDENCE_FLOOR
+    ):
+        inferred_photo_crop = "potato"
+    elif (
+        rice_mass >= UNMASKED_CROP_MASS_THRESHOLD
+        and raw_top_label.startswith("rice_")
+        and raw_top_confidence >= UNMASKED_TOP_CONFIDENCE_FLOOR
+    ):
+        inferred_photo_crop = "rice"
+
+    crop_override_detected = bool(
+        inferred_photo_crop is not None and inferred_photo_crop != crop_id
+    )
+    override_disease_id: str | None = None
+    override_is_healthy = False
+    override_confirmed = False
+
+    if crop_override_detected and inferred_photo_crop is not None:
+        override_disease_id = spec["label_disease"].get(raw_top_label)
+        override_is_healthy = raw_top_label in spec["healthy"]
+
+        inferred_indices = [
+            i for i, lbl in enumerate(labels) if spec["label_crop"].get(lbl) == inferred_photo_crop
+        ]
+        inferred_order = sorted(inferred_indices, key=lambda idx: float(probs[idx]), reverse=True)
+        inferred_mass = potato_mass if inferred_photo_crop == "potato" else rice_mass
+        runner_up_prob = (
+            float(probs[inferred_order[1]]) if len(inferred_order) > 1 else raw_top_confidence
+        )
+        override_margin = raw_top_confidence - runner_up_prob
+
+        if override_disease_id is not None and (
+            raw_top_confidence >= settings.vision_confidence_threshold
+            or (
+                raw_top_confidence >= settings.vision_margin_floor
+                and override_margin >= settings.vision_margin
+                and inferred_mass >= settings.vision_margin_min_crop_mass
+            )
+        ):
+            override_confirmed = True
+
+    return {
+        "raw_top_label": raw_top_label,
+        "raw_top_confidence": raw_top_confidence,
+        "inferred_photo_crop": inferred_photo_crop,
+        "crop_override_detected": crop_override_detected,
+        "override_disease_id": override_disease_id,
+        "override_is_healthy": override_is_healthy,
+        "override_confirmed": override_confirmed,
+    }
+
+
 def _decide(probabilities: Any, crop_id: str, spec: ModelSpec) -> VisionFacts:
     """Turn probabilities into facts, following `predict_final.py`.
 
@@ -216,6 +303,7 @@ def _decide(probabilities: Any, crop_id: str, spec: ModelSpec) -> VisionFacts:
     probs = np.asarray(probabilities, dtype=np.float64)
     ranked = np.argsort(probs)[::-1]
     top3 = ", ".join(f"{labels[int(i)]}={float(probs[int(i)]):.3f}" for i in ranked[:3])
+    unmasked = _unmasked_crop_signal(probs, ranked, crop_id, spec)
 
     crop_indices = [i for i, label in enumerate(labels) if spec["label_crop"].get(label) == crop_id]
     crop_mass = float(sum(float(probs[i]) for i in crop_indices)) if crop_indices else 0.0
@@ -241,7 +329,7 @@ def _decide(probabilities: Any, crop_id: str, spec: ModelSpec) -> VisionFacts:
     margin = confidence - float(probs[runner_up_index])
 
     log.info(
-        "vision top3 (%s, crop=%s): %s | crop_mass=%.3f best=%s(%.3f) margin=%.3f",
+        "vision top3 (%s, crop=%s): %s | crop_mass=%.3f best=%s(%.3f) margin=%.3f inferred=%s",
         spec["id"],
         crop_id,
         top3,
@@ -249,12 +337,12 @@ def _decide(probabilities: Any, crop_id: str, spec: ModelSpec) -> VisionFacts:
         label,
         confidence,
         margin,
+        unmasked["inferred_photo_crop"],
     )
 
     if confidence >= settings.vision_confidence_threshold:
-        return _identified(label, confidence, crop_id, spec)
-
-    if (
+        facts = _identified(label, confidence, crop_id, spec)
+    elif (
         confidence >= settings.vision_margin_floor
         and margin >= settings.vision_margin
         and crop_mass >= settings.vision_margin_min_crop_mass
@@ -268,9 +356,26 @@ def _decide(probabilities: Any, crop_id: str, spec: ModelSpec) -> VisionFacts:
             margin,
             crop_mass,
         )
-        return _identified(label, confidence, crop_id, spec)
+        facts = _identified(label, confidence, crop_id, spec)
+    else:
+        facts = _undetermined(label, confidence, spec)
 
-    return _undetermined(label, confidence, spec)
+    effective_crop = (
+        unmasked["inferred_photo_crop"]
+        if unmasked["crop_override_detected"]
+        else (facts["crop_id"] or unmasked["inferred_photo_crop"])
+    )
+    return {
+        **facts,
+        "raw_top_label": unmasked["raw_top_label"],
+        "raw_top_confidence": unmasked["raw_top_confidence"],
+        "inferred_photo_crop": unmasked["inferred_photo_crop"],
+        "effective_crop": effective_crop,
+        "crop_override_detected": unmasked["crop_override_detected"],
+        "override_disease_id": unmasked["override_disease_id"],
+        "override_is_healthy": unmasked["override_is_healthy"],
+        "override_confirmed": unmasked["override_confirmed"],
+    }
 
 
 def _identified(
@@ -314,6 +419,14 @@ def _unavailable(spec: ModelSpec | None = None) -> VisionFacts:
         disease_id=None,
         is_healthy=False,
         model=spec["id"] if spec else None,
+        raw_top_label=None,
+        raw_top_confidence=None,
+        inferred_photo_crop=None,
+        effective_crop=None,
+        crop_override_detected=False,
+        override_disease_id=None,
+        override_is_healthy=False,
+        override_confirmed=False,
     )
 
 
